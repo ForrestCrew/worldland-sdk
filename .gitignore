@@ -1,0 +1,15 @@
+# Binaries (root level only)
+/node
+*.exe
+/bin/
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
