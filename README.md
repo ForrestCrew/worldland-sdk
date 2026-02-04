@@ -4,36 +4,27 @@
 
 The Node daemon manages GPU containers via Docker SDK, communicates with Hub via mTLS, and provides SSH access to rental sessions.
 
-## Quick Start (5 minutes)
+## Quick Start (3 minutes)
 
-Requires: Docker with NVIDIA Container Toolkit, mTLS certificates, Ethereum wallet
+Requires: Docker with NVIDIA Container Toolkit, Ethereum wallet
 
 ```bash
 # Build Node
 go build -o node ./cmd/node
 
-# Run Node with wallet authentication (recommended)
+# Set up wallet private key
+mkdir -p ~/.worldland && chmod 700 ~/.worldland
+echo "your_64_char_private_key" > ~/.worldland/private-key.txt
+chmod 600 ~/.worldland/private-key.txt
+
+# Run Node (certificates auto-provisioned!)
 ./node \
   -hub hub.worldland.io:8443 \
-  -hub-http http://hub.worldland.io:8080 \
-  -private-key-file /path/to/private-key.txt \
-  -cert node.crt \
-  -key node.key \
-  -ca ca.crt \
-  -host your-public-hostname.com \
-  -gpu-type "NVIDIA RTX 4090" \
-  -memory-gb 24 \
-  -price-per-sec "1000000000"
-
-# Or run with mock wallet (development only)
-./node \
-  -hub localhost:8443 \
-  -node-id YOUR_NODE_ID \
-  -cert node.crt \
-  -key node.key \
-  -ca ca.crt \
-  -host localhost
+  -private-key-file ~/.worldland/private-key.txt \
+  -host $(curl -s ifconfig.me)
 ```
+
+That's it! Certificates are automatically issued and saved to `~/.worldland/certs/`.
 
 ## Prerequisites
 
@@ -50,13 +41,26 @@ docker --version     # Should be 20.10 or higher
 nvidia-smi           # Should show your GPU(s)
 ```
 
-## Wallet Authentication (SIWE)
+## Wallet Authentication (SIWE) & Auto-Bootstrap
 
-Worldland Node supports **Sign-In with Ethereum (SIWE)** for provider registration. This links your GPU node to your blockchain wallet address, enabling:
+Worldland Node supports **Sign-In with Ethereum (SIWE)** for provider registration and **automatic certificate provisioning**. This links your GPU node to your blockchain wallet address, enabling:
 
 - Automatic provider registration with real wallet address
+- **Automatic mTLS certificate issuance** (no manual cert setup!)
 - Direct settlement of rental payments to your wallet
 - On-chain identity verification
+
+### How Auto-Bootstrap Works
+
+On first run with a private key, the Node automatically:
+
+```
+1. Login with SIWE (wallet authentication)
+2. Request bootstrap certificate from Hub
+3. Save certificates to ~/.worldland/certs/
+4. Connect via mTLS
+5. Register GPU node
+```
 
 ### Setting Up Wallet Authentication
 
@@ -77,36 +81,35 @@ Worldland Node supports **Sign-In with Ethereum (SIWE)** for provider registrati
    chmod 600 ~/.worldland/private-key.txt
    ```
 
-3. **Run Node with wallet authentication**
+3. **Run Node** (certificates auto-provisioned!)
    ```bash
    ./node \
      -hub hub.worldland.io:8443 \
-     -hub-http http://hub.worldland.io:8080 \
      -private-key-file ~/.worldland/private-key.txt \
-     -cert node.crt \
-     -key node.key \
-     -ca ca.crt \
      -host your-public-ip.com \
      -gpu-type "NVIDIA RTX 4090" \
      -memory-gb 24 \
      -price-per-sec "1000000000"
    ```
 
-On startup, the Node will:
-1. Derive your wallet address from the private key
-2. Authenticate with Hub using SIWE (EIP-4361)
-3. Register your GPU node linked to your wallet address
-4. Connect via mTLS for ongoing communication
-
-**Verify registration:**
+**First run output:**
 ```
 Worldland Node starting...
 Authenticating with wallet to Hub at http://hub.worldland.io:8080...
 Wallet address: 0xYourWalletAddress
 SIWE authentication successful
+Certificates not found, requesting bootstrap certificate from Hub...
+Bootstrap certificates saved to /home/user/.worldland/certs
+  Certificate: /home/user/.worldland/certs/node.crt
+  Private Key: /home/user/.worldland/certs/node.key
+  CA Cert: /home/user/.worldland/certs/ca.crt
+  Expires: 2026-03-06T12:00:00Z
 Node registered: node_abc123
 Connected to Hub at hub.worldland.io:8443
+Node ready - API on port 8444
 ```
+
+**Subsequent runs** use the saved certificates automatically.
 
 ## Installation
 
