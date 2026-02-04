@@ -6,20 +6,33 @@ The Node daemon manages GPU containers via Docker SDK, communicates with Hub via
 
 ## Quick Start (5 minutes)
 
-Requires: Docker with NVIDIA Container Toolkit, mTLS certificates
+Requires: Docker with NVIDIA Container Toolkit, mTLS certificates, Ethereum wallet
 
 ```bash
 # Build Node
 go build -o node ./cmd/node
 
-# Run Node (replace values)
+# Run Node with wallet authentication (recommended)
+./node \
+  -hub hub.worldland.io:8443 \
+  -hub-http http://hub.worldland.io:8080 \
+  -private-key-file /path/to/private-key.txt \
+  -cert node.crt \
+  -key node.key \
+  -ca ca.crt \
+  -host your-public-hostname.com \
+  -gpu-type "NVIDIA RTX 4090" \
+  -memory-gb 24 \
+  -price-per-sec "1000000000"
+
+# Or run with mock wallet (development only)
 ./node \
   -hub localhost:8443 \
   -node-id YOUR_NODE_ID \
   -cert node.crt \
   -key node.key \
   -ca ca.crt \
-  -host your-public-hostname.com
+  -host localhost
 ```
 
 ## Prerequisites
@@ -35,6 +48,64 @@ go build -o node ./cmd/node
 go version           # Should be go1.21.0 or higher
 docker --version     # Should be 20.10 or higher
 nvidia-smi           # Should show your GPU(s)
+```
+
+## Wallet Authentication (SIWE)
+
+Worldland Node supports **Sign-In with Ethereum (SIWE)** for provider registration. This links your GPU node to your blockchain wallet address, enabling:
+
+- Automatic provider registration with real wallet address
+- Direct settlement of rental payments to your wallet
+- On-chain identity verification
+
+### Setting Up Wallet Authentication
+
+1. **Get your Ethereum private key**
+
+   Export your private key from MetaMask or another wallet. The key should be a 64-character hex string.
+
+   **Security Warning:** Never share your private key. Store it securely with restricted permissions.
+
+2. **Create a private key file**
+   ```bash
+   # Create secure directory
+   mkdir -p ~/.worldland
+   chmod 700 ~/.worldland
+
+   # Save private key (without 0x prefix)
+   echo "your_64_char_hex_private_key" > ~/.worldland/private-key.txt
+   chmod 600 ~/.worldland/private-key.txt
+   ```
+
+3. **Run Node with wallet authentication**
+   ```bash
+   ./node \
+     -hub hub.worldland.io:8443 \
+     -hub-http http://hub.worldland.io:8080 \
+     -private-key-file ~/.worldland/private-key.txt \
+     -cert node.crt \
+     -key node.key \
+     -ca ca.crt \
+     -host your-public-ip.com \
+     -gpu-type "NVIDIA RTX 4090" \
+     -memory-gb 24 \
+     -price-per-sec "1000000000"
+   ```
+
+On startup, the Node will:
+1. Derive your wallet address from the private key
+2. Authenticate with Hub using SIWE (EIP-4361)
+3. Register your GPU node linked to your wallet address
+4. Connect via mTLS for ongoing communication
+
+**Verify registration:**
+```
+Worldland Node starting...
+Authenticating with wallet to Hub at http://hub.worldland.io:8080...
+Wallet address: 0xYourWalletAddress
+SIWE authentication successful
+Node registered: node_abc123
+Connected to Hub at hub.worldland.io:8443
 ```
 
 ## Installation
@@ -118,13 +189,26 @@ Note: The root fingerprint is shown when step-ca starts. Check logs with `docker
 
 For local development, the Hub can run without mTLS verification. See Hub README for dev mode configuration.
 
-### 5. Register Node with Hub
+### 5. Set Up Wallet Authentication (Recommended)
 
-Before running the Node, you need a Node ID from Hub:
+With wallet authentication, Node automatically registers with Hub on startup.
+
+```bash
+# Create secure directory for private key
+mkdir -p ~/.worldland
+chmod 700 ~/.worldland
+
+# Save your Ethereum private key (64 hex characters, no 0x prefix)
+echo "your_private_key_here" > ~/.worldland/private-key.txt
+chmod 600 ~/.worldland/private-key.txt
+```
+
+**Alternative: Manual Registration (Development)**
+
+If not using wallet authentication, register manually via Hub API:
 
 ```bash
 # Register node via Hub API (requires SIWE authentication)
-# The response includes your node_id
 curl -X POST http://localhost:8080/api/v1/nodes/register \
   -H "Authorization: Bearer YOUR_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
@@ -134,7 +218,7 @@ curl -X POST http://localhost:8080/api/v1/nodes/register \
   }'
 ```
 
-Save the returned `node_id` for the next step.
+Save the returned `node_id` and use with `-node-id` flag.
 
 ## Running the Node
 
@@ -143,19 +227,42 @@ Save the returned `node_id` for the next step.
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `-hub` | No | localhost:8443 | Hub mTLS address |
+| `-hub-http` | No | (derived) | Hub HTTP API URL for authentication |
 | `-api-port` | No | 8444 | Node API port |
 | `-host` | Yes | (none) | Public hostname for SSH |
 | `-cert` | Yes | node.crt | Node certificate file |
 | `-key` | Yes | node.key | Node private key file |
 | `-ca` | Yes | ca.crt | CA certificate file |
-| `-node-id` | Yes | (none) | Node ID from registration |
+| `-node-id` | Conditional | (auto) | Node ID (auto-assigned with wallet auth) |
+| `-private-key` | No | (none) | Ethereum private key (hex) |
+| `-private-key-file` | No | (none) | Path to file containing private key |
+| `-gpu-type` | No | NVIDIA RTX 4090 | GPU type for registration |
+| `-memory-gb` | No | 24 | GPU memory in GB |
+| `-price-per-sec` | No | 1000000000 | Price per second in wei |
+
+**Note:** Either provide `-private-key` or `-private-key-file` for wallet authentication. If neither is provided, the Node runs in mock mode (development only) and requires `-node-id`.
 
 ### Development (local Hub)
 
+**With wallet authentication:**
 ```bash
 ./node \
   -hub localhost:8443 \
-  -node-id abc123 \
+  -hub-http http://localhost:8080 \
+  -private-key-file ~/.worldland/private-key.txt \
+  -cert node.crt \
+  -key node.key \
+  -ca ca.crt \
+  -host localhost \
+  -gpu-type "Mock GPU" \
+  -memory-gb 24
+```
+
+**Without wallet (mock mode):**
+```bash
+./node \
+  -hub localhost:8443 \
+  -node-id test-node-123 \
   -cert node.crt \
   -key node.key \
   -ca ca.crt \
@@ -167,12 +274,16 @@ Save the returned `node_id` for the next step.
 ```bash
 ./node \
   -hub hub.worldland.io:8443 \
-  -node-id YOUR_NODE_ID \
+  -hub-http https://hub.worldland.io:8080 \
+  -private-key-file /etc/worldland/private-key.txt \
   -cert /etc/worldland/node.crt \
   -key /etc/worldland/node.key \
   -ca /etc/worldland/ca.crt \
   -host gpu-node-1.yourcompany.com \
-  -api-port 8444
+  -api-port 8444 \
+  -gpu-type "NVIDIA RTX 4090" \
+  -memory-gb 24 \
+  -price-per-sec "1000000000"
 ```
 
 **Verify:**
@@ -207,6 +318,7 @@ worldland-node/
 │   ├── adapters/
 │   │   └── nvml/          # NVIDIA GPU detection
 │   ├── api/               # mTLS API handlers
+│   ├── auth/              # SIWE wallet authentication
 │   ├── container/         # Docker container management
 │   ├── domain/            # Domain models (GPU specs, rentals)
 │   ├── port/              # Dynamic SSH port allocation
@@ -260,9 +372,41 @@ curl http://localhost:8080/health
 
 ### Error: "node-id is required"
 
-**Cause:** Missing `-node-id` flag.
+**Cause:** Missing `-node-id` flag and no wallet authentication configured.
 
-**Solution:** Register with Hub first to get a node ID (see Step 5 in Installation).
+**Solution:** Either:
+1. Use wallet authentication with `-private-key-file` (recommended)
+2. Or provide `-node-id` for mock mode
+
+### Error: "SIWE authentication failed"
+
+**Cause:** Wallet authentication failed with Hub.
+
+**Solution:**
+```bash
+# Check Hub HTTP API is accessible
+curl http://hub.worldland.io:8080/health
+
+# Verify private key format (64 hex chars, no 0x prefix)
+cat ~/.worldland/private-key.txt | wc -c  # Should be 64 or 65
+
+# Check Hub's SIWE domain configuration
+# Hub must have SIWE_DOMAIN set to match the connection
+```
+
+### Error: "Failed to create SIWE client: invalid private key"
+
+**Cause:** Private key is malformed.
+
+**Solution:**
+```bash
+# Private key should be 64 hex characters
+# Remove 0x prefix if present
+# Remove any whitespace or newlines
+
+# Verify key format
+cat ~/.worldland/private-key.txt | tr -d '\n' | wc -c  # Should be 64
+```
 
 ### Docker GPU access fails
 
