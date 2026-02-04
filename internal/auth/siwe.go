@@ -241,3 +241,44 @@ func (c *SIWEClient) RegisterNode(gpuUUID, gpuType string, memoryGB int, pricePe
 
 	return result.NodeID, nil
 }
+
+// CertificateBundle contains the certificate bundle from Hub
+type CertificateBundle struct {
+	Certificate   string `json:"certificate"`
+	PrivateKey    string `json:"private_key"`
+	CACertificate string `json:"ca_certificate"`
+	ExpiresAt     string `json:"expires_at"`
+	WalletAddress string `json:"wallet_address"`
+}
+
+// IssueCertificate requests a bootstrap mTLS certificate from Hub
+// This is used for initial node setup before mTLS connection
+func (c *SIWEClient) IssueCertificate() (*CertificateBundle, error) {
+	if c.token == "" {
+		return nil, fmt.Errorf("not authenticated - call Login() first")
+	}
+
+	req, err := http.NewRequest("POST", c.hubURL+"/api/v1/certs/bootstrap", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("certificate issuance failed: %d - %s", resp.StatusCode, string(respBody))
+	}
+
+	var bundle CertificateBundle
+	if err := json.NewDecoder(resp.Body).Decode(&bundle); err != nil {
+		return nil, err
+	}
+
+	return &bundle, nil
+}

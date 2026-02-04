@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,54 @@ import (
 	"github.com/worldland/worldland-node/internal/services"
 )
 
+// Default certificate directory
+func defaultCertDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".worldland/certs"
+	}
+	return filepath.Join(home, ".worldland", "certs")
+}
+
+// certsExist checks if all required certificate files exist
+func certsExist(certFile, keyFile, caFile string) bool {
+	for _, f := range []string{certFile, keyFile, caFile} {
+		if _, err := os.Stat(f); os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
+}
+
+// saveCertificates saves the certificate bundle to disk
+func saveCertificates(certDir string, bundle *auth.CertificateBundle) (certPath, keyPath, caPath string, err error) {
+	// Create cert directory with secure permissions
+	if err := os.MkdirAll(certDir, 0700); err != nil {
+		return "", "", "", err
+	}
+
+	certPath = filepath.Join(certDir, "node.crt")
+	keyPath = filepath.Join(certDir, "node.key")
+	caPath = filepath.Join(certDir, "ca.crt")
+
+	// Save certificate
+	if err := os.WriteFile(certPath, []byte(bundle.Certificate), 0644); err != nil {
+		return "", "", "", err
+	}
+
+	// Save private key with restricted permissions
+	if err := os.WriteFile(keyPath, []byte(bundle.PrivateKey), 0600); err != nil {
+		return "", "", "", err
+	}
+
+	// Save CA certificate
+	if err := os.WriteFile(caPath, []byte(bundle.CACertificate), 0644); err != nil {
+		return "", "", "", err
+	}
+
+	return certPath, keyPath, caPath, nil
+}
+
 func main() {
 	log.Println("Worldland Node starting...")
 
@@ -31,9 +80,10 @@ func main() {
 	hubHTTP := flag.String("hub-http", "", "Hub HTTP API URL for authentication (e.g., http://localhost:8080)")
 	apiPort := flag.String("api-port", "8444", "Node API mTLS port")
 	hostAddr := flag.String("host", "", "Public host address for SSH connections (e.g., provider.example.com)")
-	certFile := flag.String("cert", "node.crt", "Node certificate file")
-	keyFile := flag.String("key", "node.key", "Node private key file")
-	caFile := flag.String("ca", "ca.crt", "CA certificate file")
+	certFile := flag.String("cert", "", "Node certificate file (auto-generated if not specified)")
+	keyFile := flag.String("key", "", "Node private key file (auto-generated if not specified)")
+	caFile := flag.String("ca", "", "CA certificate file (auto-generated if not specified)")
+	certDir := flag.String("cert-dir", defaultCertDir(), "Directory for auto-generated certificates")
 	nodeID := flag.String("node-id", "", "Node ID (from registration, defaults to certificate CN)")
 
 	// Wallet authentication flags
@@ -50,7 +100,18 @@ func main() {
 		*hostAddr = "localhost"
 	}
 
-	// Wallet authentication (if private key provided)
+	// Set default cert paths if not specified
+	if *certFile == "" {
+		*certFile = filepath.Join(*certDir, "node.crt")
+	}
+	if *keyFile == "" {
+		*keyFile = filepath.Join(*certDir, "node.key")
+	}
+	if *caFile == "" {
+		*caFile = filepath.Join(*certDir, "ca.crt")
+	}
+
+	// Wallet authentication and certificate bootstrap
 	var walletAddress string
 	var siweClient *auth.SIWEClient
 
@@ -90,6 +151,34 @@ func main() {
 		}
 		log.Println("SIWE authentication successful")
 
+		// Check if certificates need to be bootstrapped
+		if !certsExist(*certFile, *keyFile, *caFile) {
+			log.Println("Certificates not found, requesting bootstrap certificate from Hub...")
+
+			bundle, err := siweClient.IssueCertificate()
+			if err != nil {
+				log.Fatalf("Failed to issue bootstrap certificate: %v", err)
+			}
+
+			// Save certificates to disk
+			certPath, keyPath, caPath, err := saveCertificates(*certDir, bundle)
+			if err != nil {
+				log.Fatalf("Failed to save certificates: %v", err)
+			}
+
+			*certFile = certPath
+			*keyFile = keyPath
+			*caFile = caPath
+
+			log.Printf("Bootstrap certificates saved to %s", *certDir)
+			log.Printf("  Certificate: %s", certPath)
+			log.Printf("  Private Key: %s", keyPath)
+			log.Printf("  CA Cert: %s", caPath)
+			log.Printf("  Expires: %s", bundle.ExpiresAt)
+		} else {
+			log.Printf("Using existing certificates from %s", *certDir)
+		}
+
 		// Register node via HTTP API
 		gpuUUID := "GPU-" + walletAddress[:10] // Use wallet prefix as GPU UUID
 		registeredNodeID, err := siweClient.RegisterNode(gpuUUID, *gpuType, *memoryGB, *pricePerSec)
@@ -103,7 +192,11 @@ func main() {
 			}
 		}
 	} else {
-		log.Println("No private key provided - using mTLS auto-registration (mock wallet)")
+		log.Println("No private key provided - using existing certificates (mock wallet mode)")
+		// In mock mode, certificates must already exist
+		if !certsExist(*certFile, *keyFile, *caFile) {
+			log.Fatalf("Certificates not found at %s. Either provide -private-key for auto-bootstrap or manually place certificates.", *certDir)
+		}
 	}
 
 	// Load certificates
