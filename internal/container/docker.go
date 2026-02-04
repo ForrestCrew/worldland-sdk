@@ -18,7 +18,7 @@ import (
 // ContainerConfig holds configuration for creating a GPU container
 type ContainerConfig struct {
 	SessionID    string // Used as container name
-	Image        string // e.g., "nvidia/cuda:12.1-runtime-ubuntu22.04"
+	Image        string // e.g., "nvidia/cuda:12.1.1-runtime-ubuntu22.04"
 	GPUDeviceID  string // NVIDIA UUID (not index)
 	SSHPublicKey string // User's SSH public key
 	MemoryBytes  int64  // Memory limit in bytes

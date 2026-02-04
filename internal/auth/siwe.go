@@ -17,6 +17,7 @@ import (
 // SIWEClient handles Sign-In with Ethereum authentication
 type SIWEClient struct {
 	hubURL     string
+	domain     string // SIWE domain (defaults to hubURL host)
 	privateKey *ecdsa.PrivateKey
 	address    string
 	token      string // JWT token after successful login
@@ -25,6 +26,11 @@ type SIWEClient struct {
 
 // NewSIWEClient creates a new SIWE authentication client
 func NewSIWEClient(hubURL string, privateKeyHex string) (*SIWEClient, error) {
+	return NewSIWEClientWithDomain(hubURL, privateKeyHex, "")
+}
+
+// NewSIWEClientWithDomain creates a new SIWE authentication client with custom domain
+func NewSIWEClientWithDomain(hubURL string, privateKeyHex string, domain string) (*SIWEClient, error) {
 	// Remove 0x prefix if present
 	privateKeyHex = strings.TrimPrefix(privateKeyHex, "0x")
 
@@ -49,6 +55,7 @@ func NewSIWEClient(hubURL string, privateKeyHex string) (*SIWEClient, error) {
 
 	return &SIWEClient{
 		hubURL:     strings.TrimSuffix(hubURL, "/"),
+		domain:     domain,
 		privateKey: privateKey,
 		address:    address,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
@@ -115,15 +122,18 @@ func (c *SIWEClient) getNonce() (string, error) {
 }
 
 func (c *SIWEClient) createSIWEMessage(nonce string) string {
-	// Parse domain from hub URL
-	domain := "localhost"
-	if strings.Contains(c.hubURL, "://") {
-		parts := strings.Split(c.hubURL, "://")
-		if len(parts) > 1 {
-			hostPart := strings.Split(parts[1], ":")[0]
-			hostPart = strings.Split(hostPart, "/")[0]
-			if hostPart != "" {
-				domain = hostPart
+	// Use configured domain, or parse from hub URL
+	domain := c.domain
+	if domain == "" {
+		domain = "localhost"
+		if strings.Contains(c.hubURL, "://") {
+			parts := strings.Split(c.hubURL, "://")
+			if len(parts) > 1 {
+				hostPart := strings.Split(parts[1], ":")[0]
+				hostPart = strings.Split(hostPart, "/")[0]
+				if hostPart != "" {
+					domain = hostPart
+				}
 			}
 		}
 	}

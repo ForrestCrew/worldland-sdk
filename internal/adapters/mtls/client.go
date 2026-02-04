@@ -18,9 +18,10 @@ type Command struct {
 
 // CommandAck represents acknowledgment sent to Hub
 type CommandAck struct {
-	CommandID string `json:"command_id"`
-	Status    string `json:"status"` // "ok" or "error"
-	Error     string `json:"error,omitempty"`
+	CommandID string                 `json:"command_id"`
+	Status    string                 `json:"status"` // "ok" or "error"
+	Error     string                 `json:"error,omitempty"`
+	Payload   map[string]interface{} `json:"payload,omitempty"` // Additional response data
 }
 
 // Client handles mTLS connection to Hub

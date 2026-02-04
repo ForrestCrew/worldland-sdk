@@ -95,7 +95,7 @@ func (h *RentalHandler) HandleStartRental(w http.ResponseWriter, r *http.Request
 
 	// Default values per CONTEXT.md
 	if req.Image == "" {
-		req.Image = "nvidia/cuda:12.1-runtime-ubuntu22.04"
+		req.Image = "nvidia/cuda:12.1.1-runtime-ubuntu22.04"
 	}
 	if req.MemoryBytes == 0 {
 		req.MemoryBytes = 16 * 1024 * 1024 * 1024 // 16GB default

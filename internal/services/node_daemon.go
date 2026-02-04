@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -103,6 +104,9 @@ func (d *NodeDaemon) handleK8sJoin(cmd mtls.Command) mtls.CommandAck {
 		}
 	}
 
+	// Get hostname for K8s node labeling
+	hostname, _ := os.Hostname()
+
 	// Check if already joined (look for kubelet running)
 	if d.isAlreadyK8sNode() {
 		log.Printf("Node is already part of K8s cluster")
@@ -110,6 +114,9 @@ func (d *NodeDaemon) handleK8sJoin(cmd mtls.Command) mtls.CommandAck {
 			CommandID: cmd.ID,
 			Status:    "ok",
 			Error:     "already_joined",
+			Payload: map[string]interface{}{
+				"hostname": hostname,
+			},
 		}
 	}
 
@@ -128,6 +135,9 @@ func (d *NodeDaemon) handleK8sJoin(cmd mtls.Command) mtls.CommandAck {
 	return mtls.CommandAck{
 		CommandID: cmd.ID,
 		Status:    "ok",
+		Payload: map[string]interface{}{
+			"hostname": hostname,
+		},
 	}
 }
 

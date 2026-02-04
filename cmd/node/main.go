@@ -125,6 +125,7 @@ func main() {
 	// Wallet authentication flags
 	privateKey := flag.String("private-key", "", "Ethereum private key (hex) for wallet authentication")
 	privateKeyFile := flag.String("private-key-file", "", "Path to file containing private key")
+	siweDomain := flag.String("siwe-domain", "", "SIWE domain for authentication (defaults to hub-http host)")
 	gpuType := flag.String("gpu-type", "NVIDIA RTX 4090", "GPU type for registration")
 	memoryGB := flag.Int("memory-gb", 24, "GPU memory in GB for registration")
 	pricePerSec := flag.String("price-per-sec", "1000000000", "Price per second in wei")
@@ -190,7 +191,7 @@ func main() {
 		log.Printf("Authenticating with wallet to Hub at %s...", hubHTTPURL)
 
 		var err error
-		siweClient, err = auth.NewSIWEClient(hubHTTPURL, privKeyHex)
+		siweClient, err = auth.NewSIWEClientWithDomain(hubHTTPURL, privKeyHex, *siweDomain)
 		if err != nil {
 			log.Fatalf("Failed to create SIWE client: %v", err)
 		}
