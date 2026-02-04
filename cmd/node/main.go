@@ -43,6 +43,42 @@ func certsExist(certFile, keyFile, caFile string) bool {
 	return true
 }
 
+// getMachineID returns a unique identifier for the machine
+// Uses /etc/machine-id on Linux, falls back to hostname + MAC address
+func getMachineID() string {
+	// Try /etc/machine-id first (standard on systemd systems)
+	if data, err := os.ReadFile("/etc/machine-id"); err == nil {
+		machineID := strings.TrimSpace(string(data))
+		if machineID != "" {
+			return "MACHINE-" + machineID[:16] // Use first 16 chars
+		}
+	}
+
+	// Fallback: use hostname
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	return "CPU-" + hostname
+}
+
+// getGPUUUID returns the UUID of the first GPU, or a fallback ID
+func getGPUUUID() string {
+	// Try to get real GPU UUID from NVML
+	provider := nvml.NewNVMLProvider()
+	if err := provider.Init(); err != nil {
+		return "GPU-UNKNOWN"
+	}
+	defer provider.Shutdown()
+
+	specs, err := provider.GetSpecs()
+	if err != nil || len(specs) == 0 {
+		return "GPU-UNKNOWN"
+	}
+
+	return specs[0].UUID
+}
+
 // saveCertificates saves the certificate bundle to disk
 func saveCertificates(certDir string, bundle *auth.CertificateBundle) (certPath, keyPath, caPath string, err error) {
 	// Create cert directory with secure permissions
@@ -197,8 +233,15 @@ func main() {
 		}
 
 		// Register node via HTTP API
-		gpuUUID := "GPU-" + walletAddress[:10] // Use wallet prefix as GPU UUID
-		registeredNodeID, err := siweClient.RegisterNode(gpuUUID, *gpuType, *memoryGB, *pricePerSec)
+		// Use GPU UUID for GPU nodes, Machine ID for CPU nodes
+		var deviceUUID string
+		if isCPUNode {
+			deviceUUID = getMachineID()
+		} else {
+			// Get real GPU UUID from NVML
+			deviceUUID = getGPUUUID()
+		}
+		registeredNodeID, err := siweClient.RegisterNode(deviceUUID, *gpuType, *memoryGB, *pricePerSec)
 		if err != nil {
 			// Node might already be registered, continue
 			log.Printf("Node registration: %v (may already exist)", err)
