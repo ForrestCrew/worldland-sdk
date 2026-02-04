@@ -31,14 +31,22 @@ That's it! Certificates are automatically issued and saved to `~/.worldland/cert
 **Required:**
 - Go 1.21.0 or higher ([download](https://go.dev/dl/))
 - Docker 20.10+ ([download](https://docs.docker.com/get-docker/))
+- Kubernetes components (kubeadm, kubelet, kubectl) for cluster join
+- containerd as container runtime
+
+**For GPU Nodes (optional):**
 - NVIDIA GPU with drivers installed
 - NVIDIA Container Toolkit
+
+> **Note:** GPU is optional. Nodes without NVIDIA GPUs automatically register as "CPU Node".
 
 **Check versions:**
 ```bash
 go version           # Should be go1.21.0 or higher
 docker --version     # Should be 20.10 or higher
-nvidia-smi           # Should show your GPU(s)
+kubeadm version      # Should be v1.29+
+kubectl version      # Should be v1.29+
+nvidia-smi           # (GPU nodes only) Should show your GPU(s)
 ```
 
 ## Wallet Authentication (SIWE) & Auto-Bootstrap
@@ -55,11 +63,13 @@ Worldland Node supports **Sign-In with Ethereum (SIWE)** for provider registrati
 On first run with a private key, the Node automatically:
 
 ```
-1. Login with SIWE (wallet authentication)
-2. Request bootstrap certificate from Hub
-3. Save certificates to ~/.worldland/certs/
-4. Connect via mTLS
-5. Register GPU node
+1. Detect GPU/CPU → determine node type
+2. Login with SIWE (wallet authentication)
+3. Request bootstrap certificate from Hub
+4. Save certificates to ~/.worldland/certs/
+5. Connect via mTLS
+6. Register node (GPU or CPU)
+7. Join K8s cluster (if kubeadm installed)
 ```
 
 ### Setting Up Wallet Authentication
@@ -143,20 +153,74 @@ docker run --rm --gpus all nvidia/cuda:12.1-base nvidia-smi
 
 You should see your GPU(s) listed. If this fails, check NVIDIA drivers and Container Toolkit installation.
 
-### 2. Install Go dependencies
+### 2. Install Kubernetes Components
+
+Node joins the Worldland K8s cluster for workload orchestration. Install these components:
+
+**Ubuntu/Debian:**
+```bash
+# Install prerequisites
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+
+# Add Kubernetes repository
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+# Install kubeadm, kubelet, kubectl
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+
+# Install and configure containerd
+sudo apt-get install -y containerd
+sudo mkdir -p /etc/containerd
+containerd config default | sudo tee /etc/containerd/config.toml
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+
+# Configure kernel modules
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+# Configure sysctl
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sudo sysctl --system
+
+# Enable kubelet
+sudo systemctl enable kubelet
+```
+
+**Verify installation:**
+```bash
+kubeadm version
+kubectl version --client
+containerd --version
+```
+
+### 3. Install Go dependencies
 
 ```bash
 cd worldland-node
 go mod download
 ```
 
-### 3. Build Node
+### 4. Build Node
 
 ```bash
 go build -o node ./cmd/node
 ```
 
-### 4. Generate mTLS Certificates
+### 5. Generate mTLS Certificates
 
 Nodes communicate with Hub using mTLS (mutual TLS). You need:
 - CA certificate (from Hub's step-ca)
@@ -192,7 +256,7 @@ Note: The root fingerprint is shown when step-ca starts. Check logs with `docker
 
 For local development, the Hub can run without mTLS verification. See Hub README for dev mode configuration.
 
-### 5. Set Up Wallet Authentication (Recommended)
+### 6. Set Up Wallet Authentication (Recommended)
 
 With wallet authentication, Node automatically registers with Hub on startup.
 
@@ -298,17 +362,33 @@ Detected GPUs: [NVIDIA GeForce RTX 4090]
 Node ready, listening on :8444
 ```
 
-## GPU Detection
+## GPU Detection & CPU Node Support
 
 Node automatically detects NVIDIA GPUs using NVML (NVIDIA Management Library).
 
-**Mock mode:** If NVML is not available (no NVIDIA GPU), Node uses a mock GPU provider for development.
+### GPU Node
+If NVIDIA GPU is detected, the node registers with actual GPU specifications:
+```
+Worldland Node starting...
+GPU detected - will register as GPU Node
+Detected GPUs: [NVIDIA GeForce RTX 4090]
+```
+
+### CPU Node
+If no GPU is detected (NVML initialization fails), the node automatically registers as a "CPU Node":
+```
+Worldland Node starting...
+No GPU detected (NVML: Initialization error) - will register as CPU Node
+Node registered as: CPU Node (memory: 1GB)
+```
+
+CPU Nodes can still participate in the Worldland network for non-GPU workloads.
 
 **List detected GPUs:**
 ```bash
 # Check what Node sees
 ./node -node-id test -cert node.crt -key node.key -ca ca.crt
-# Look for "Detected GPUs" in startup logs
+# Look for "Detected GPUs" or "CPU Node" in startup logs
 ```
 
 ## Project Structure
@@ -420,6 +500,37 @@ docker info | grep -i nvidia
 # If missing, configure runtime
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
+```
+
+### Error: "kubeadm: command not found"
+
+**Cause:** Kubernetes components not installed.
+
+**Solution:**
+```bash
+# Install kubeadm, kubelet, kubectl (see Installation section 2)
+sudo apt-get install -y kubelet kubeadm kubectl
+```
+
+### Error: "K8s join failed"
+
+**Cause:** Kubelet not running or misconfigured.
+
+**Solution:**
+```bash
+# Check kubelet status
+sudo systemctl status kubelet
+
+# Check containerd
+sudo systemctl status containerd
+
+# Verify kernel modules
+lsmod | grep br_netfilter
+lsmod | grep overlay
+
+# If missing, load them
+sudo modprobe br_netfilter
+sudo modprobe overlay
 ```
 
 ## Security Considerations
