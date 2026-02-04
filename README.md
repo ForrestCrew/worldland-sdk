@@ -17,14 +17,16 @@ mkdir -p ~/.worldland && chmod 700 ~/.worldland
 echo "your_64_char_private_key" > ~/.worldland/private-key.txt
 chmod 600 ~/.worldland/private-key.txt
 
-# Run Node (certificates auto-provisioned!)
+# Run Node (certificates auto-provisioned, GPU auto-detected!)
 ./node \
-  -hub hub.worldland.io:8443 \
+  -hub 35.193.4.15:8443 \
+  -hub-http http://35.193.4.15:8080 \
+  -siwe-domain localhost:3000 \
   -private-key-file ~/.worldland/private-key.txt \
   -host $(curl -s ifconfig.me)
 ```
 
-That's it! Certificates are automatically issued and saved to `~/.worldland/certs/`.
+That's it! GPU type and memory are **automatically detected** from NVML. Certificates are automatically issued and saved to `~/.worldland/certs/`.
 
 ## Prerequisites
 
@@ -91,21 +93,25 @@ On first run with a private key, the Node automatically:
    chmod 600 ~/.worldland/private-key.txt
    ```
 
-3. **Run Node** (certificates auto-provisioned!)
+3. **Run Node** (certificates auto-provisioned, GPU auto-detected!)
    ```bash
    ./node \
-     -hub hub.worldland.io:8443 \
+     -hub 35.193.4.15:8443 \
+     -hub-http http://35.193.4.15:8080 \
+     -siwe-domain localhost:3000 \
      -private-key-file ~/.worldland/private-key.txt \
-     -host your-public-ip.com \
-     -gpu-type "NVIDIA RTX 4090" \
-     -memory-gb 24 \
+     -host $(curl -s ifconfig.me) \
      -price-per-sec "1000000000"
    ```
+
+   Note: `-gpu-type` and `-memory-gb` are auto-detected from NVML.
 
 **First run output:**
 ```
 Worldland Node starting...
-Authenticating with wallet to Hub at http://hub.worldland.io:8080...
+GPU detected: NVIDIA Tesla T4 (16 GB)
+GPU detected - will register as GPU Node
+Authenticating with wallet to Hub at http://35.193.4.15:8080...
 Wallet address: 0xYourWalletAddress
 SIWE authentication successful
 Certificates not found, requesting bootstrap certificate from Hub...
@@ -115,13 +121,51 @@ Bootstrap certificates saved to /home/user/.worldland/certs
   CA Cert: /home/user/.worldland/certs/ca.crt
   Expires: 2026-03-06T12:00:00Z
 Node registered: node_abc123
-Connected to Hub at hub.worldland.io:8443
+Connected to Hub at 35.193.4.15:8443
 Node ready - API on port 8444
 ```
 
 **Subsequent runs** use the saved certificates automatically.
 
 ## Installation
+
+### Cloud VM Setup (GCP/AWS)
+
+For cloud GPU VMs, complete these steps first:
+
+**1. Create GPU VM (GCP example):**
+```bash
+gcloud compute instances create gpu-node \
+  --zone=us-central1-a \
+  --machine-type=n1-standard-4 \
+  --accelerator=type=nvidia-tesla-t4,count=1 \
+  --maintenance-policy=TERMINATE \
+  --image-family=ubuntu-2204-lts \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=100GB
+```
+
+**2. Install NVIDIA drivers (version 535 for kernel compatibility):**
+```bash
+# Install driver detection utility
+sudo apt-get update
+sudo apt-get install -y ubuntu-drivers-common
+
+# Install NVIDIA driver 535 (compatible with GCP kernels)
+sudo ubuntu-drivers install nvidia:535
+
+# Reboot to load driver
+sudo reboot
+
+# Verify after reboot
+nvidia-smi
+```
+
+**3. Disable swap (required for Kubernetes):**
+```bash
+sudo swapoff -a
+sudo sed -i '/ swap / s/^/#/' /etc/fstab
+```
 
 ### 1. Install NVIDIA Container Toolkit
 
@@ -297,33 +341,33 @@ Save the returned `node_id` and use with `-node-id` flag.
 | `-hub-http` | No | (derived) | Hub HTTP API URL for authentication |
 | `-api-port` | No | 8444 | Node API port |
 | `-host` | Yes | (none) | Public hostname for SSH |
-| `-cert` | Yes | node.crt | Node certificate file |
-| `-key` | Yes | node.key | Node private key file |
-| `-ca` | Yes | ca.crt | CA certificate file |
-| `-node-id` | Conditional | (auto) | Node ID (auto-assigned with wallet auth) |
+| `-cert` | No | ~/.worldland/certs/node.crt | Node certificate file (auto-provisioned) |
+| `-key` | No | ~/.worldland/certs/node.key | Node private key file (auto-provisioned) |
+| `-ca` | No | ~/.worldland/certs/ca.crt | CA certificate file (auto-provisioned) |
+| `-cert-dir` | No | ~/.worldland/certs | Directory for auto-generated certificates |
+| `-node-id` | No | (auto) | Node ID (auto-assigned from certificate CN) |
 | `-private-key` | No | (none) | Ethereum private key (hex) |
 | `-private-key-file` | No | (none) | Path to file containing private key |
-| `-gpu-type` | No | NVIDIA RTX 4090 | GPU type for registration |
-| `-memory-gb` | No | 24 | GPU memory in GB |
+| `-siwe-domain` | No | (derived from hub-http) | SIWE domain for authentication (e.g., localhost:3000) |
+| `-gpu-type` | No | (auto-detected) | GPU type for registration (auto-detected from NVML) |
+| `-memory-gb` | No | (auto-detected) | GPU memory in GB (auto-detected from NVML) |
 | `-price-per-sec` | No | 1000000000 | Price per second in wei |
 
 **Note:** Either provide `-private-key` or `-private-key-file` for wallet authentication. If neither is provided, the Node runs in mock mode (development only) and requires `-node-id`.
 
 ### Development (local Hub)
 
-**With wallet authentication:**
+**With wallet authentication (recommended):**
 ```bash
 ./node \
   -hub localhost:8443 \
   -hub-http http://localhost:8080 \
+  -siwe-domain localhost:3000 \
   -private-key-file ~/.worldland/private-key.txt \
-  -cert node.crt \
-  -key node.key \
-  -ca ca.crt \
-  -host localhost \
-  -gpu-type "Mock GPU" \
-  -memory-gb 24
+  -host localhost
 ```
+
+GPU type and memory are auto-detected. Certificates are auto-provisioned to `~/.worldland/certs/`.
 
 **Without wallet (mock mode):**
 ```bash
@@ -336,43 +380,50 @@ Save the returned `node_id` and use with `-node-id` flag.
   -host localhost
 ```
 
-### Production
+### Production (GCP/AWS)
 
 ```bash
 ./node \
-  -hub hub.worldland.io:8443 \
-  -hub-http https://hub.worldland.io:8080 \
+  -hub 35.193.4.15:8443 \
+  -hub-http http://35.193.4.15:8080 \
+  -siwe-domain localhost:3000 \
   -private-key-file /etc/worldland/private-key.txt \
-  -cert /etc/worldland/node.crt \
-  -key /etc/worldland/node.key \
-  -ca /etc/worldland/ca.crt \
-  -host gpu-node-1.yourcompany.com \
+  -host $(curl -s ifconfig.me) \
   -api-port 8444 \
-  -gpu-type "NVIDIA RTX 4090" \
-  -memory-gb 24 \
   -price-per-sec "1000000000"
 ```
+
+GPU type and memory are auto-detected from NVML. Certificates are auto-provisioned on first run.
 
 **Verify:**
 Node should log:
 ```
 Worldland Node starting...
-Connected to Hub at hub.worldland.io:8443
-Detected GPUs: [NVIDIA GeForce RTX 4090]
-Node ready, listening on :8444
+GPU detected: NVIDIA Tesla T4 (16 GB)
+GPU detected - will register as GPU Node
+Authenticating with wallet to Hub at http://35.193.4.15:8080...
+Wallet address: 0xYourWalletAddress
+SIWE authentication successful
+Bootstrap certificates saved to /home/user/.worldland/certs
+Node registered: node_abc123
+Connected to Hub at 35.193.4.15:8443
+Node ready - API on port 8444
 ```
 
 ## GPU Detection & CPU Node Support
 
-Node automatically detects NVIDIA GPUs using NVML (NVIDIA Management Library).
+Node **automatically detects** NVIDIA GPUs using NVML (NVIDIA Management Library) and registers with the correct GPU type and memory.
 
-### GPU Node
-If NVIDIA GPU is detected, the node registers with actual GPU specifications:
+### GPU Node (Auto-detected)
+If NVIDIA GPU is detected, the node automatically registers with actual GPU specifications:
 ```
 Worldland Node starting...
+GPU detected: NVIDIA Tesla T4 (16 GB)
 GPU detected - will register as GPU Node
-Detected GPUs: [NVIDIA GeForce RTX 4090]
+Node registered: node_abc123
 ```
+
+The GPU type (e.g., "NVIDIA Tesla T4") and memory (e.g., 16 GB) are automatically detected from the hardware. You can override these with `-gpu-type` and `-memory-gb` flags if needed.
 
 ### CPU Node
 If no GPU is detected (NVML initialization fails), the node automatically registers as a "CPU Node":
@@ -384,11 +435,12 @@ Node registered as: CPU Node (memory: 1GB)
 
 CPU Nodes can still participate in the Worldland network for non-GPU workloads.
 
-**List detected GPUs:**
+**Verify GPU detection:**
 ```bash
-# Check what Node sees
-./node -node-id test -cert node.crt -key node.key -ca ca.crt
-# Look for "Detected GPUs" or "CPU Node" in startup logs
+# Check what GPU Node sees
+nvidia-smi  # Shows GPU model and memory
+./node -hub localhost:8443 -private-key-file ~/.worldland/private-key.txt -host localhost
+# Look for "GPU detected: <model> (<memory> GB)" in startup logs
 ```
 
 ## Project Structure

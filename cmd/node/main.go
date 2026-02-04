@@ -151,6 +151,8 @@ func main() {
 	// Early GPU detection to determine node type before registration
 	// This check runs before SIWE auth so we register with correct GPU info
 	isCPUNode := false
+	detectedGPUType := ""
+	detectedMemoryGB := 0
 	testNVML := nvml.NewNVMLProvider()
 	if err := testNVML.Init(); err != nil {
 		log.Printf("No GPU detected (%v) - will register as CPU Node", err)
@@ -161,6 +163,23 @@ func main() {
 			*memoryGB = 1 // Minimum non-zero value for API validation
 		}
 	} else {
+		// Auto-detect GPU type and memory from NVML
+		specs, err := testNVML.GetSpecs()
+		if err == nil && len(specs) > 0 {
+			detectedGPUType = specs[0].Name
+			detectedMemoryGB = int(specs[0].MemoryTotal / 1024) // Convert MB to GB
+			log.Printf("GPU detected: %s (%d GB)", detectedGPUType, detectedMemoryGB)
+
+			// Only override if user didn't specify custom values
+			if *gpuType == "NVIDIA RTX 4090" { // default value not changed by user
+				*gpuType = detectedGPUType
+			}
+			if *memoryGB == 24 { // default value not changed by user
+				*memoryGB = detectedMemoryGB
+			}
+		} else {
+			log.Printf("GPU detected but failed to get specs: %v", err)
+		}
 		testNVML.Shutdown()
 		log.Println("GPU detected - will register as GPU Node")
 	}
