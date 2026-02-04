@@ -121,7 +121,7 @@ func main() {
 		// Override default GPU flags for CPU node
 		if *gpuType == "NVIDIA RTX 4090" { // default value not changed by user
 			*gpuType = "CPU Node"
-			*memoryGB = 0
+			*memoryGB = 1 // Minimum non-zero value for API validation
 		}
 	} else {
 		testNVML.Shutdown()
