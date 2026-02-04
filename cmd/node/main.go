@@ -111,6 +111,23 @@ func main() {
 		*caFile = filepath.Join(*certDir, "ca.crt")
 	}
 
+	// Early GPU detection to determine node type before registration
+	// This check runs before SIWE auth so we register with correct GPU info
+	isCPUNode := false
+	testNVML := nvml.NewNVMLProvider()
+	if err := testNVML.Init(); err != nil {
+		log.Printf("No GPU detected (%v) - will register as CPU Node", err)
+		isCPUNode = true
+		// Override default GPU flags for CPU node
+		if *gpuType == "NVIDIA RTX 4090" { // default value not changed by user
+			*gpuType = "CPU Node"
+			*memoryGB = 0
+		}
+	} else {
+		testNVML.Shutdown()
+		log.Println("GPU detected - will register as GPU Node")
+	}
+
 	// Wallet authentication and certificate bootstrap
 	var walletAddress string
 	var siweClient *auth.SIWEClient
@@ -227,13 +244,9 @@ func main() {
 		log.Printf("Using certificate CN as node-id: %s", *nodeID)
 	}
 
-	// Initialize GPU provider (try real NVML first, fall back to CPU node)
+	// Initialize GPU provider (use early detection result)
 	var gpuProvider domain.GPUProvider
-	var isCPUNode bool
-	realNVML := nvml.NewNVMLProvider()
-	if err := realNVML.Init(); err != nil {
-		log.Printf("No GPU detected (%v) - registering as CPU Node", err)
-		isCPUNode = true
+	if isCPUNode {
 		// CPU node uses a minimal mock provider for the daemon interface
 		gpuProvider = nvml.NewMockGPUProvider(
 			[]domain.GPUMetrics{
@@ -256,17 +269,13 @@ func main() {
 				},
 			},
 		)
-		// Override GPU type for CPU node
-		if *gpuType == "NVIDIA RTX 4090" { // default value not changed
-			*gpuType = "CPU Node"
-			*memoryGB = 0
-		}
 	} else {
-		realNVML.Shutdown()
+		realNVML := nvml.NewNVMLProvider()
+		if err := realNVML.Init(); err != nil {
+			log.Fatalf("GPU was detected earlier but failed to initialize: %v", err)
+		}
 		gpuProvider = realNVML
-		log.Printf("GPU detected - registering as GPU Node")
 	}
-	_ = isCPUNode // Will be used for future CPU-specific logic
 
 	// Create daemon for GPU monitoring and Hub connection
 	daemon := services.NewNodeDaemon(gpuProvider, *nodeID)
