@@ -227,37 +227,46 @@ func main() {
 		log.Printf("Using certificate CN as node-id: %s", *nodeID)
 	}
 
-	// Initialize GPU provider (try real NVML first, fall back to mock)
+	// Initialize GPU provider (try real NVML first, fall back to CPU node)
 	var gpuProvider domain.GPUProvider
+	var isCPUNode bool
 	realNVML := nvml.NewNVMLProvider()
 	if err := realNVML.Init(); err != nil {
-		log.Printf("Warning: NVML not available (%v), using mock provider", err)
-		// Use mock provider for development without NVIDIA hardware
+		log.Printf("No GPU detected (%v) - registering as CPU Node", err)
+		isCPUNode = true
+		// CPU node uses a minimal mock provider for the daemon interface
 		gpuProvider = nvml.NewMockGPUProvider(
 			[]domain.GPUMetrics{
 				{
-					UUID:        "mock-gpu-1",
-					Name:        "Mock GPU",
-					MemoryTotal: 24000,
-					MemoryUsed:  8000,
-					GPUUtil:     50,
-					MemoryUtil:  33,
-					Temperature: 60,
+					UUID:        "cpu-node",
+					Name:        "CPU Only",
+					MemoryTotal: 0,
+					MemoryUsed:  0,
+					GPUUtil:     0,
+					MemoryUtil:  0,
+					Temperature: 0,
 				},
 			},
 			[]domain.GPUSpec{
 				{
-					UUID:        "mock-gpu-1",
-					Name:        "Mock GPU",
-					MemoryTotal: 24000,
-					DriverVer:   "535.129.03",
+					UUID:        "cpu-node",
+					Name:        "CPU Only",
+					MemoryTotal: 0,
+					DriverVer:   "N/A",
 				},
 			},
 		)
+		// Override GPU type for CPU node
+		if *gpuType == "NVIDIA RTX 4090" { // default value not changed
+			*gpuType = "CPU Node"
+			*memoryGB = 0
+		}
 	} else {
 		realNVML.Shutdown()
 		gpuProvider = realNVML
+		log.Printf("GPU detected - registering as GPU Node")
 	}
+	_ = isCPUNode // Will be used for future CPU-specific logic
 
 	// Create daemon for GPU monitoring and Hub connection
 	daemon := services.NewNodeDaemon(gpuProvider, *nodeID)
