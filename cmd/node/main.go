@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/worldland/worldland-node/internal/adapters/nvml"
 	"github.com/worldland/worldland-node/internal/api"
+	"github.com/worldland/worldland-node/internal/auth"
 	"github.com/worldland/worldland-node/internal/container"
 	"github.com/worldland/worldland-node/internal/domain"
 	"github.com/worldland/worldland-node/internal/port"
@@ -26,17 +28,82 @@ func main() {
 
 	// Command line flags
 	hubAddr := flag.String("hub", "localhost:8443", "Hub mTLS address")
+	hubHTTP := flag.String("hub-http", "", "Hub HTTP API URL for authentication (e.g., http://localhost:8080)")
 	apiPort := flag.String("api-port", "8444", "Node API mTLS port")
 	hostAddr := flag.String("host", "", "Public host address for SSH connections (e.g., provider.example.com)")
 	certFile := flag.String("cert", "node.crt", "Node certificate file")
 	keyFile := flag.String("key", "node.key", "Node private key file")
 	caFile := flag.String("ca", "ca.crt", "CA certificate file")
 	nodeID := flag.String("node-id", "", "Node ID (from registration, defaults to certificate CN)")
+
+	// Wallet authentication flags
+	privateKey := flag.String("private-key", "", "Ethereum private key (hex) for wallet authentication")
+	privateKeyFile := flag.String("private-key-file", "", "Path to file containing private key")
+	gpuType := flag.String("gpu-type", "NVIDIA RTX 4090", "GPU type for registration")
+	memoryGB := flag.Int("memory-gb", 24, "GPU memory in GB for registration")
+	pricePerSec := flag.String("price-per-sec", "1000000000", "Price per second in wei")
+
 	flag.Parse()
 
 	if *hostAddr == "" {
 		log.Println("Warning: host address not specified, defaulting to localhost")
 		*hostAddr = "localhost"
+	}
+
+	// Wallet authentication (if private key provided)
+	var walletAddress string
+	var siweClient *auth.SIWEClient
+
+	privKeyHex := *privateKey
+	if privKeyHex == "" && *privateKeyFile != "" {
+		// Read from file
+		data, err := os.ReadFile(*privateKeyFile)
+		if err != nil {
+			log.Fatalf("Failed to read private key file: %v", err)
+		}
+		privKeyHex = strings.TrimSpace(string(data))
+	}
+
+	if privKeyHex != "" {
+		// Derive Hub HTTP URL from mTLS address if not specified
+		hubHTTPURL := *hubHTTP
+		if hubHTTPURL == "" {
+			// Convert hub:8443 to http://hub:8080
+			hubHost := strings.Split(*hubAddr, ":")[0]
+			hubHTTPURL = "http://" + hubHost + ":8080"
+		}
+
+		log.Printf("Authenticating with wallet to Hub at %s...", hubHTTPURL)
+
+		var err error
+		siweClient, err = auth.NewSIWEClient(hubHTTPURL, privKeyHex)
+		if err != nil {
+			log.Fatalf("Failed to create SIWE client: %v", err)
+		}
+
+		walletAddress = siweClient.GetAddress()
+		log.Printf("Wallet address: %s", walletAddress)
+
+		// Login with SIWE
+		if err := siweClient.Login(); err != nil {
+			log.Fatalf("SIWE authentication failed: %v", err)
+		}
+		log.Println("SIWE authentication successful")
+
+		// Register node via HTTP API
+		gpuUUID := "GPU-" + walletAddress[:10] // Use wallet prefix as GPU UUID
+		registeredNodeID, err := siweClient.RegisterNode(gpuUUID, *gpuType, *memoryGB, *pricePerSec)
+		if err != nil {
+			// Node might already be registered, continue
+			log.Printf("Node registration: %v (may already exist)", err)
+		} else {
+			log.Printf("Node registered: %s", registeredNodeID)
+			if *nodeID == "" {
+				*nodeID = registeredNodeID
+			}
+		}
+	} else {
+		log.Println("No private key provided - using mTLS auto-registration (mock wallet)")
 	}
 
 	// Load certificates

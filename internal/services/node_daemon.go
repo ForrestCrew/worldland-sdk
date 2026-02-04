@@ -3,7 +3,10 @@ package services
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"log"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/worldland/worldland-node/internal/adapters/mtls"
@@ -77,10 +80,100 @@ func (d *NodeDaemon) handleCommand(cmd mtls.Command) mtls.CommandAck {
 		// TODO: Implement in Phase 4
 		log.Printf("Stopping job (Phase 4 implementation)")
 		return mtls.CommandAck{CommandID: cmd.ID, Status: "ok"}
+	case "join_k8s":
+		// Handle K8s cluster join command
+		return d.handleK8sJoin(cmd)
 	default:
 		log.Printf("Unknown command type: %s", cmd.Type)
 		return mtls.CommandAck{CommandID: cmd.ID, Status: "error", Error: "unknown command"}
 	}
+}
+
+// handleK8sJoin executes kubeadm join to add this node to the K8s cluster
+func (d *NodeDaemon) handleK8sJoin(cmd mtls.Command) mtls.CommandAck {
+	log.Printf("Processing K8s join command")
+
+	// Extract join command from payload
+	joinCommand, ok := cmd.Payload["join_command"].(string)
+	if !ok || joinCommand == "" {
+		return mtls.CommandAck{
+			CommandID: cmd.ID,
+			Status:    "error",
+			Error:     "missing join_command in payload",
+		}
+	}
+
+	// Check if already joined (look for kubelet running)
+	if d.isAlreadyK8sNode() {
+		log.Printf("Node is already part of K8s cluster")
+		return mtls.CommandAck{
+			CommandID: cmd.ID,
+			Status:    "ok",
+			Error:     "already_joined",
+		}
+	}
+
+	// Execute the join command
+	log.Printf("Executing kubeadm join...")
+	if err := d.executeKubeadmJoin(joinCommand); err != nil {
+		log.Printf("kubeadm join failed: %v", err)
+		return mtls.CommandAck{
+			CommandID: cmd.ID,
+			Status:    "error",
+			Error:     fmt.Sprintf("join failed: %v", err),
+		}
+	}
+
+	log.Printf("Successfully joined K8s cluster")
+	return mtls.CommandAck{
+		CommandID: cmd.ID,
+		Status:    "ok",
+	}
+}
+
+// isAlreadyK8sNode checks if this node is already part of a K8s cluster
+func (d *NodeDaemon) isAlreadyK8sNode() bool {
+	// Check if kubelet is running and configured
+	cmd := exec.Command("systemctl", "is-active", "kubelet")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(output)) == "active"
+}
+
+// executeKubeadmJoin runs the kubeadm join command
+func (d *NodeDaemon) executeKubeadmJoin(joinCommand string) error {
+	// Parse the join command into arguments
+	// The join command looks like: sudo kubeadm join IP:PORT --token TOKEN --discovery-token-ca-cert-hash HASH
+	parts := strings.Fields(joinCommand)
+
+	// Find the actual kubeadm command (skip sudo if present)
+	cmdStart := 0
+	for i, p := range parts {
+		if p == "kubeadm" {
+			cmdStart = i
+			break
+		}
+	}
+
+	if cmdStart >= len(parts) {
+		return fmt.Errorf("invalid join command: kubeadm not found")
+	}
+
+	// Execute with sudo
+	args := append([]string{"kubeadm"}, parts[cmdStart+1:]...)
+	cmd := exec.Command("sudo", args...)
+
+	log.Printf("Running: sudo %s", strings.Join(args, " "))
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, string(output))
+	}
+
+	log.Printf("kubeadm join output: %s", string(output))
+	return nil
 }
 
 // reportMetrics periodically collects and reports GPU metrics
