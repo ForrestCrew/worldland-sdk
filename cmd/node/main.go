@@ -19,6 +19,7 @@ import (
 	"github.com/worldland/worldland-node/internal/auth"
 	"github.com/worldland/worldland-node/internal/container"
 	"github.com/worldland/worldland-node/internal/domain"
+	"github.com/worldland/worldland-node/internal/mining"
 	"github.com/worldland/worldland-node/internal/port"
 	"github.com/worldland/worldland-node/internal/rental"
 	"github.com/worldland/worldland-node/internal/services"
@@ -121,6 +122,11 @@ func main() {
 	caFile := flag.String("ca", "", "CA certificate file (auto-generated if not specified)")
 	certDir := flag.String("cert-dir", defaultCertDir(), "Directory for auto-generated certificates")
 	nodeID := flag.String("node-id", "", "Node ID (from registration, defaults to certificate CN)")
+
+	// Mining flags
+	enableMining := flag.Bool("enable-mining", true, "Enable automatic GPU mining when idle")
+	miningImage := flag.String("mining-image", "mingeyom/worldland-mio:latest", "Docker image for mining")
+	miningDataDir := flag.String("mining-data-dir", "/data/worldland", "Host path for mining blockchain data")
 
 	// Wallet authentication flags
 	privateKey := flag.String("private-key", "", "Ethereum private key (hex) for wallet authentication")
@@ -340,8 +346,59 @@ func main() {
 		gpuProvider = realNVML
 	}
 
+	// Initialize rental infrastructure (before daemon so it can receive commands)
+	dockerService, err := container.NewDockerService()
+	if err != nil {
+		log.Fatalf("Failed to initialize Docker service: %v", err)
+	}
+
+	// Create port manager (30000-32000 range, 30-minute grace period)
+	portManager := port.NewPortManager(30000, 32000, 30*time.Minute)
+
+	// Create rental executor
+	rentalExecutor := rental.NewRentalExecutor(dockerService, portManager, 30*time.Minute)
+
+	// Initialize mining daemon if enabled
+	var miningDaemon *mining.MiningDaemon
+	if *enableMining && !isCPUNode {
+		// Collect GPU UUIDs for mining config
+		var gpuUUIDs []string
+		if testNVML := nvml.NewNVMLProvider(); testNVML != nil {
+			if err := testNVML.Init(); err == nil {
+				specs, err := testNVML.GetSpecs()
+				if err == nil {
+					for _, spec := range specs {
+						gpuUUIDs = append(gpuUUIDs, spec.UUID)
+					}
+				}
+				testNVML.Shutdown()
+			}
+		}
+
+		miningCfg := mining.MiningConfig{
+			Enabled:       true,
+			WalletAddress: walletAddress,
+			Image:         *miningImage,
+			GPUDeviceIDs:  gpuUUIDs,
+			DataDir:       *miningDataDir,
+			ChainID:       10396,
+			P2PPort:       30303,
+			HTTPRPCPort:   8545,
+		}
+
+		miningDaemon = mining.NewMiningDaemon(dockerService, miningCfg)
+		log.Printf("Mining daemon initialized: image=%s gpus=%d", *miningImage, len(gpuUUIDs))
+	}
+
 	// Create daemon for GPU monitoring and Hub connection
+	// Wire rental executor so daemon can handle start_rental/stop_rental mTLS commands
 	daemon := services.NewNodeDaemon(gpuProvider, *nodeID)
+	daemon.WithRentalExecutor(rentalExecutor, *hostAddr)
+
+	// Wire mining daemon if enabled
+	if miningDaemon != nil {
+		daemon.WithMiningDaemon(miningDaemon)
+	}
 
 	// Connect to Hub for heartbeat and metrics reporting
 	if err := daemon.ConnectToHub(*hubAddr, cert, caCertPool); err != nil {
@@ -355,21 +412,22 @@ func main() {
 		}
 	}()
 
-	log.Println("Node daemon running")
+	log.Println("Node daemon running (Docker rental executor enabled)")
 
-	// Initialize rental infrastructure
-	dockerService, err := container.NewDockerService()
-	if err != nil {
-		log.Fatalf("Failed to initialize Docker service: %v", err)
+	// Start mining daemon in background if configured
+	if miningDaemon != nil {
+		go func() {
+			miningCtx := context.Background()
+			if err := miningDaemon.Start(miningCtx); err != nil {
+				log.Printf("Mining daemon start error: %v", err)
+			}
+			// Start health monitoring loop
+			miningDaemon.MonitorLoop(miningCtx)
+		}()
+		log.Println("Mining daemon started in background")
 	}
 
-	// Create port manager (30000-32000 range, 30-minute grace period)
-	portManager := port.NewPortManager(30000, 32000, 30*time.Minute)
-
-	// Create rental executor
-	rentalExecutor := rental.NewRentalExecutor(dockerService, portManager, 30*time.Minute)
-
-	// Create API handler
+	// Create API handler (HTTP fallback for direct Node API calls)
 	rentalHandler := api.NewRentalHandler(rentalExecutor, *hostAddr)
 
 	// Create HTTP mux with routes
@@ -412,6 +470,16 @@ func main() {
 	<-sigCh
 
 	log.Println("Shutting down...")
+
+	// Stop mining daemon first (releases GPUs)
+	if miningDaemon != nil {
+		miningDaemon.Close()
+		shutdownMiningCtx, cancelMining := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := miningDaemon.Stop(shutdownMiningCtx); err != nil {
+			log.Printf("Mining daemon shutdown error: %v", err)
+		}
+		cancelMining()
+	}
 
 	// Stop daemon
 	daemon.Stop()

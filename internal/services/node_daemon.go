@@ -1,26 +1,35 @@
 package services
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"log"
-	"os"
-	"os/exec"
-	"strings"
+	"net"
 	"time"
 
 	"github.com/worldland/worldland-node/internal/adapters/mtls"
 	"github.com/worldland/worldland-node/internal/domain"
+	"github.com/worldland/worldland-node/internal/mining"
+	"github.com/worldland/worldland-node/internal/rental"
 )
 
-// NodeDaemon manages the node lifecycle
+// NodeDaemon manages the node lifecycle, handles Hub commands via mTLS,
+// and executes Docker-based GPU rentals.
 type NodeDaemon struct {
 	gpuProvider     domain.GPUProvider
 	mtlsClient      *mtls.Client
 	nodeID          string
+	hostAddr        string // Public host address for SSH connections
 	metricsInterval time.Duration
 	stopCh          chan struct{}
+
+	// Docker rental executor (set via WithRentalExecutor)
+	rentalExecutor *rental.RentalExecutor
+
+	// Mining daemon (set via WithMiningDaemon)
+	miningDaemon *mining.MiningDaemon
 }
 
 // NewNodeDaemon creates a new node daemon
@@ -31,6 +40,19 @@ func NewNodeDaemon(gpuProvider domain.GPUProvider, nodeID string) *NodeDaemon {
 		metricsInterval: 30 * time.Second,
 		stopCh:          make(chan struct{}),
 	}
+}
+
+// WithRentalExecutor sets the rental executor for Docker-based rentals
+func (d *NodeDaemon) WithRentalExecutor(executor *rental.RentalExecutor, hostAddr string) *NodeDaemon {
+	d.rentalExecutor = executor
+	d.hostAddr = hostAddr
+	return d
+}
+
+// WithMiningDaemon sets the mining daemon for auto-mining when GPU is idle
+func (d *NodeDaemon) WithMiningDaemon(md *mining.MiningDaemon) *NodeDaemon {
+	d.miningDaemon = md
+	return d
 }
 
 // ConnectToHub establishes mTLS connection to Hub
@@ -73,117 +95,159 @@ func (d *NodeDaemon) handleCommand(cmd mtls.Command) mtls.CommandAck {
 	log.Printf("Received command: %s (type: %s)", cmd.ID, cmd.Type)
 
 	switch cmd.Type {
+	case "start_rental":
+		return d.handleStartRental(cmd)
+	case "stop_rental":
+		return d.handleStopRental(cmd)
 	case "start_job":
-		// TODO: Implement in Phase 4
-		log.Printf("Starting job (Phase 4 implementation)")
-		return mtls.CommandAck{CommandID: cmd.ID, Status: "ok"}
+		// Legacy alias for start_rental
+		return d.handleStartRental(cmd)
 	case "stop_job":
-		// TODO: Implement in Phase 4
-		log.Printf("Stopping job (Phase 4 implementation)")
-		return mtls.CommandAck{CommandID: cmd.ID, Status: "ok"}
-	case "join_k8s":
-		// Handle K8s cluster join command
-		return d.handleK8sJoin(cmd)
+		// Legacy alias for stop_rental
+		return d.handleStopRental(cmd)
 	default:
 		log.Printf("Unknown command type: %s", cmd.Type)
 		return mtls.CommandAck{CommandID: cmd.ID, Status: "error", Error: "unknown command"}
 	}
 }
 
-// handleK8sJoin executes kubeadm join to add this node to the K8s cluster
-func (d *NodeDaemon) handleK8sJoin(cmd mtls.Command) mtls.CommandAck {
-	log.Printf("Processing K8s join command")
-
-	// Extract join command from payload
-	joinCommand, ok := cmd.Payload["join_command"].(string)
-	if !ok || joinCommand == "" {
+// handleStartRental creates and starts a Docker container for a GPU rental
+func (d *NodeDaemon) handleStartRental(cmd mtls.Command) mtls.CommandAck {
+	if d.rentalExecutor == nil {
 		return mtls.CommandAck{
 			CommandID: cmd.ID,
 			Status:    "error",
-			Error:     "missing join_command in payload",
+			Error:     "rental executor not configured",
 		}
 	}
 
-	// Get hostname for K8s node labeling
-	hostname, _ := os.Hostname()
-
-	// Check if already joined (look for kubelet running)
-	if d.isAlreadyK8sNode() {
-		log.Printf("Node is already part of K8s cluster")
-		return mtls.CommandAck{
-			CommandID: cmd.ID,
-			Status:    "ok",
-			Error:     "already_joined",
-			Payload: map[string]interface{}{
-				"hostname": hostname,
-			},
-		}
+	// Extract payload fields
+	sessionID, _ := cmd.Payload["session_id"].(string)
+	if sessionID == "" {
+		return mtls.CommandAck{CommandID: cmd.ID, Status: "error", Error: "missing session_id"}
 	}
 
-	// Execute the join command
-	log.Printf("Executing kubeadm join...")
-	if err := d.executeKubeadmJoin(joinCommand); err != nil {
-		log.Printf("kubeadm join failed: %v", err)
+	image, _ := cmd.Payload["image"].(string)
+	if image == "" {
+		image = "nvidia/cuda:12.1.1-runtime-ubuntu22.04"
+	}
+
+	gpuDeviceID, _ := cmd.Payload["gpu_device_id"].(string)
+	sshPassword, _ := cmd.Payload["ssh_password"].(string)
+
+	cpuCount := int64(4)
+	if v, ok := cmd.Payload["cpu_count"].(float64); ok {
+		cpuCount = int64(v)
+	}
+
+	memoryMB := int64(16384)
+	if v, ok := cmd.Payload["memory_mb"].(float64); ok {
+		memoryMB = int64(v)
+	}
+
+	log.Printf("Starting rental: session=%s image=%s gpu=%s", sessionID, image, gpuDeviceID)
+
+	// Pause mining to release GPU for rental
+	if d.miningDaemon != nil && gpuDeviceID != "" {
+		pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := d.miningDaemon.PauseForRental(pauseCtx, []string{gpuDeviceID}); err != nil {
+			log.Printf("Warning: failed to pause mining for rental: %v", err)
+		}
+		pauseCancel()
+	}
+
+	// Use rental executor to create and start Docker container
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	connInfo, err := d.rentalExecutor.StartRental(ctx, rental.StartRentalRequest{
+		SessionID:    sessionID,
+		Image:        image,
+		GPUDeviceID:  gpuDeviceID,
+		SSHPublicKey: sshPassword, // Reused as password/key
+		MemoryBytes:  memoryMB * 1024 * 1024,
+		CPUCount:     cpuCount,
+		Host:         d.hostAddr,
+	})
+	if err != nil {
+		log.Printf("Failed to start rental %s: %v", sessionID, err)
 		return mtls.CommandAck{
 			CommandID: cmd.ID,
 			Status:    "error",
-			Error:     fmt.Sprintf("join failed: %v", err),
+			Error:     fmt.Sprintf("failed to start rental: %v", err),
 		}
 	}
 
-	log.Printf("Successfully joined K8s cluster")
+	log.Printf("Rental started: session=%s ssh=%s:%d", sessionID, connInfo.Host, connInfo.Port)
+
+	// Resolve public IP if host is hostname
+	sshHost := d.hostAddr
+	if sshHost == "" || sshHost == "localhost" {
+		// Try to get the machine's public IP
+		sshHost = getOutboundIP()
+	}
+
 	return mtls.CommandAck{
 		CommandID: cmd.ID,
 		Status:    "ok",
 		Payload: map[string]interface{}{
-			"hostname": hostname,
+			"session_id":   sessionID,
+			"ssh_host":     sshHost,
+			"ssh_port":     float64(connInfo.Port),
+			"ssh_user":     connInfo.User,
+			"container_id": connInfo.ContainerID,
 		},
 	}
 }
 
-// isAlreadyK8sNode checks if this node is already part of a K8s cluster
-func (d *NodeDaemon) isAlreadyK8sNode() bool {
-	// Check if kubelet is running and configured
-	cmd := exec.Command("systemctl", "is-active", "kubelet")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(output)) == "active"
-}
-
-// executeKubeadmJoin runs the kubeadm join command
-func (d *NodeDaemon) executeKubeadmJoin(joinCommand string) error {
-	// Parse the join command into arguments
-	// The join command looks like: sudo kubeadm join IP:PORT --token TOKEN --discovery-token-ca-cert-hash HASH
-	parts := strings.Fields(joinCommand)
-
-	// Find the actual kubeadm command (skip sudo if present)
-	cmdStart := 0
-	for i, p := range parts {
-		if p == "kubeadm" {
-			cmdStart = i
-			break
+// handleStopRental stops and cleans up a Docker container for a GPU rental
+func (d *NodeDaemon) handleStopRental(cmd mtls.Command) mtls.CommandAck {
+	if d.rentalExecutor == nil {
+		return mtls.CommandAck{
+			CommandID: cmd.ID,
+			Status:    "error",
+			Error:     "rental executor not configured",
 		}
 	}
 
-	if cmdStart >= len(parts) {
-		return fmt.Errorf("invalid join command: kubeadm not found")
+	sessionID, _ := cmd.Payload["session_id"].(string)
+	if sessionID == "" {
+		return mtls.CommandAck{CommandID: cmd.ID, Status: "error", Error: "missing session_id"}
 	}
 
-	// Execute with sudo
-	args := append([]string{"kubeadm"}, parts[cmdStart+1:]...)
-	cmd := exec.Command("sudo", args...)
+	log.Printf("Stopping rental: session=%s", sessionID)
 
-	log.Printf("Running: sudo %s", strings.Join(args, " "))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, string(output))
+	if err := d.rentalExecutor.StopRental(ctx, sessionID); err != nil {
+		log.Printf("Failed to stop rental %s: %v", sessionID, err)
+		// Return ok even on error - Hub should mark session as stopped regardless
+		return mtls.CommandAck{
+			CommandID: cmd.ID,
+			Status:    "ok",
+			Error:     fmt.Sprintf("stop warning: %v", err),
+		}
 	}
 
-	log.Printf("kubeadm join output: %s", string(output))
-	return nil
+	log.Printf("Rental stopped: session=%s", sessionID)
+
+	// Resume mining after rental ends - GPU is now available
+	if d.miningDaemon != nil {
+		resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := d.miningDaemon.ResumeAfterRental(resumeCtx, []string{}); err != nil {
+			log.Printf("Warning: failed to resume mining after rental: %v", err)
+		}
+		resumeCancel()
+	}
+
+	return mtls.CommandAck{
+		CommandID: cmd.ID,
+		Status:    "ok",
+		Payload: map[string]interface{}{
+			"session_id": sessionID,
+		},
+	}
 }
 
 // reportMetrics periodically collects and reports GPU metrics
@@ -202,7 +266,7 @@ func (d *NodeDaemon) reportMetrics() {
 				continue
 			}
 			log.Printf("Collected metrics for %d GPU(s)", len(metrics))
-			// TODO: Send metrics to Hub in Phase 3
+			// TODO: Send metrics to Hub via mTLS
 		}
 	}
 }
@@ -213,4 +277,15 @@ func (d *NodeDaemon) Stop() {
 	if d.mtlsClient != nil {
 		d.mtlsClient.Close()
 	}
+}
+
+// getOutboundIP gets the preferred outbound IP of this machine
+func getOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "localhost"
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
 }
