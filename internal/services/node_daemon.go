@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -164,7 +165,7 @@ func (d *NodeDaemon) handleStartRental(cmd mtls.Command) mtls.CommandAck {
 		SessionID:    sessionID,
 		Image:        image,
 		GPUDeviceID:  gpuDeviceID,
-		SSHPublicKey: sshPassword, // Reused as password/key
+		SSHPassword: sshPassword,
 		MemoryBytes:  memoryMB * 1024 * 1024,
 		CPUCount:     cpuCount,
 		Host:         d.hostAddr,
@@ -250,7 +251,7 @@ func (d *NodeDaemon) handleStopRental(cmd mtls.Command) mtls.CommandAck {
 	}
 }
 
-// reportMetrics periodically collects and reports GPU metrics
+// reportMetrics periodically collects and reports GPU metrics + mining status
 func (d *NodeDaemon) reportMetrics() {
 	ticker := time.NewTicker(d.metricsInterval)
 	defer ticker.Stop()
@@ -266,9 +267,44 @@ func (d *NodeDaemon) reportMetrics() {
 				continue
 			}
 			log.Printf("Collected metrics for %d GPU(s)", len(metrics))
-			// TODO: Send metrics to Hub via mTLS
+
+			// Build heartbeat message with GPU metrics + mining status
+			heartbeat := d.buildHeartbeat(metrics)
+			if d.mtlsClient != nil {
+				if err := d.mtlsClient.Send(heartbeat); err != nil {
+					log.Printf("Failed to send heartbeat: %v", err)
+				}
+			}
 		}
 	}
+}
+
+// buildHeartbeat creates a JSON heartbeat message with metrics and mining status
+func (d *NodeDaemon) buildHeartbeat(gpuMetrics []domain.GPUMetrics) []byte {
+	payload := map[string]interface{}{
+		"gpu_metrics": gpuMetrics,
+	}
+
+	// Include mining status if mining daemon is configured
+	if d.miningDaemon != nil {
+		status := d.miningDaemon.Status()
+		payload["mining"] = map[string]interface{}{
+			"state":        string(status.State),
+			"container_id": status.ContainerID,
+			"gpu_count":    status.GPUCount,
+		}
+		if status.StartedAt != nil {
+			payload["mining"].(map[string]interface{})["started_at"] = status.StartedAt.Format(time.RFC3339)
+		}
+	}
+
+	msg := map[string]interface{}{
+		"type":    "heartbeat",
+		"payload": payload,
+	}
+
+	data, _ := json.Marshal(msg)
+	return data
 }
 
 // Stop gracefully stops the daemon

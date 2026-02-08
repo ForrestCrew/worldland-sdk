@@ -3,12 +3,16 @@ package container
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
@@ -17,12 +21,14 @@ import (
 
 // ContainerConfig holds configuration for creating a GPU container
 type ContainerConfig struct {
-	SessionID    string // Used as container name
-	Image        string // e.g., "nvidia/cuda:12.1.1-runtime-ubuntu22.04"
-	GPUDeviceID  string // NVIDIA UUID (not index)
-	SSHPublicKey string // User's SSH public key
-	MemoryBytes  int64  // Memory limit in bytes
-	CPUCount     int64  // CPU count (in NanoCPUs / 1e9)
+	SessionID   string // Used as container name
+	Image       string // e.g., "nvidia/cuda:12.1.1-runtime-ubuntu22.04"
+	GPUDeviceID string // NVIDIA UUID (not index)
+	SSHPassword string // SSH password for the user
+	SSHPort     int    // Host port to bind for SSH (container:22 -> host:SSHPort)
+	MemoryBytes int64  // Memory limit in bytes
+	CPUCount    int64  // CPU count (in NanoCPUs / 1e9)
+	UseImageEntrypoint bool // If true, use the image's default entrypoint (no SSH setup)
 }
 
 // ContainerInfo contains information about a running container
@@ -46,6 +52,8 @@ type DockerClient interface {
 	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
 	ContainerInspect(ctx context.Context, containerID string) (types.ContainerJSON, error)
 	ContainerWait(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
+	ImagePull(ctx context.Context, refStr string, options image.PullOptions) (io.ReadCloser, error)
+	ImageInspect(ctx context.Context, imageID string, inspectOpts ...client.ImageInspectOption) (image.InspectResponse, error)
 	Close() error
 }
 
@@ -66,44 +74,109 @@ func NewDockerServiceWithClient(cli DockerClient) *DockerService {
 	return &DockerService{cli: cli}
 }
 
-// CreateContainer creates a GPU container with NVIDIA runtime
+// ensureImage pulls a Docker image if it's not available locally.
+func (s *DockerService) ensureImage(ctx context.Context, imageName string) error {
+	// Try to inspect the image first — if it exists locally, no pull needed
+	_, err := s.cli.ImageInspect(ctx, imageName)
+	if err == nil {
+		return nil
+	}
+
+	slog.Info("image not found locally, pulling from registry", "image", imageName)
+
+	reader, err := s.cli.ImagePull(ctx, imageName, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to pull image %s: %w", imageName, err)
+	}
+	defer reader.Close()
+
+	// Consume the reader to complete the pull (progress output is discarded)
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		return fmt.Errorf("error during image pull %s: %w", imageName, err)
+	}
+
+	slog.Info("image pulled successfully", "image", imageName)
+	return nil
+}
+
+// sshSetupScript is the entrypoint script that installs and starts SSH server
+// inside any base image (CUDA, PyTorch, TensorFlow, etc.)
+const sshSetupScript = `set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq openssh-server sudo > /dev/null 2>&1
+
+# Create user with password
+useradd -m -s /bin/bash "$USER_NAME" 2>/dev/null || true
+echo "$USER_NAME:$SSH_PASSWORD" | chpasswd
+echo "$USER_NAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Configure sshd
+mkdir -p /run/sshd
+sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+
+echo "SSH server ready on port 22"
+exec /usr/sbin/sshd -D
+`
+
+// CreateContainer creates a GPU container with NVIDIA runtime and SSH access
 func (s *DockerService) CreateContainer(ctx context.Context, cfg ContainerConfig) (string, error) {
-	// Expose SSH port
-	exposedPorts := nat.PortSet{
-		"22/tcp": struct{}{},
+	// Auto-pull image if not available locally
+	if err := s.ensureImage(ctx, cfg.Image); err != nil {
+		return "", fmt.Errorf("failed to ensure image: %w", err)
 	}
 
-	// Environment variables for SSH setup
-	envVars := []string{
-		fmt.Sprintf("PUBLIC_KEY=%s", cfg.SSHPublicKey),
-		"USER_NAME=ubuntu",
-		"SUDO_ACCESS=true",
+	// GPU device selection via NVIDIA_VISIBLE_DEVICES
+	// Use "all" by default; for multi-GPU hosts, use device index (e.g., "0", "1")
+	// Note: GPU UUIDs don't work with nvidia runtime auto/CDI mode
+	gpuDevice := "all"
+	if cfg.GPUDeviceID != "" && cfg.GPUDeviceID != "all" && !isGPUUUID(cfg.GPUDeviceID) {
+		gpuDevice = cfg.GPUDeviceID // device index like "0", "1"
 	}
 
-	// Container configuration
-	containerConfig := &container.Config{
-		Image:        cfg.Image,
-		Env:          envVars,
-		ExposedPorts: exposedPorts,
+	var containerConfig *container.Config
+	var portBindings nat.PortMap
+
+	if cfg.UseImageEntrypoint {
+		// Mining mode: use image's default entrypoint, no SSH
+		containerConfig = &container.Config{
+			Image: cfg.Image,
+			Env: []string{
+				fmt.Sprintf("NVIDIA_VISIBLE_DEVICES=%s", gpuDevice),
+				"NVIDIA_DRIVER_CAPABILITIES=all",
+			},
+		}
+	} else {
+		// Rental mode: inject SSH setup as entrypoint
+		containerConfig = &container.Config{
+			Image: cfg.Image,
+			Env: []string{
+				fmt.Sprintf("SSH_PASSWORD=%s", cfg.SSHPassword),
+				"USER_NAME=ubuntu",
+				fmt.Sprintf("NVIDIA_VISIBLE_DEVICES=%s", gpuDevice),
+				"NVIDIA_DRIVER_CAPABILITIES=all",
+			},
+			ExposedPorts: nat.PortSet{"22/tcp": struct{}{}},
+			Entrypoint:   []string{"/bin/bash", "-c"},
+			Cmd:          []string{sshSetupScript},
+		}
+		portBindings = nat.PortMap{
+			"22/tcp": []nat.PortBinding{
+				{HostIP: "0.0.0.0", HostPort: strconv.Itoa(cfg.SSHPort)},
+			},
+		}
 	}
 
-	// Host configuration with GPU device request
+	// Host configuration with nvidia runtime
 	hostConfig := &container.HostConfig{
-		// Resource limits with NVIDIA device request
+		Runtime: "nvidia",
 		Resources: container.Resources{
 			Memory:   cfg.MemoryBytes,
 			NanoCPUs: cfg.CPUCount * 1e9, // Convert to NanoCPUs
-			// NVIDIA device request using UUID (not index)
-			DeviceRequests: []container.DeviceRequest{
-				{
-					Driver:       "nvidia",
-					DeviceIDs:    []string{cfg.GPUDeviceID},
-					Capabilities: [][]string{{"gpu"}},
-				},
-			},
 		},
-		// Publish all exposed ports to random host ports
-		PublishAllPorts: true,
+		PortBindings: portBindings,
 	}
 
 	// Create container
@@ -216,6 +289,11 @@ func (s *DockerService) InspectContainer(ctx context.Context, containerID string
 		State:       state,
 		Health:      health,
 	}, nil
+}
+
+// isGPUUUID returns true if the string looks like a GPU UUID (e.g., "GPU-751b4c38-...")
+func isGPUUUID(s string) bool {
+	return strings.HasPrefix(s, "GPU-") || strings.HasPrefix(s, "MIG-")
 }
 
 // Close closes the Docker client connection

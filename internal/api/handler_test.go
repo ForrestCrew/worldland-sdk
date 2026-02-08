@@ -60,7 +60,7 @@ func TestHandleStartRental_Success(t *testing.T) {
 	reqBody := StartRentalRequest{
 		SessionID:    "session-123",
 		GPUDeviceID:  "GPU-uuid-456",
-		SSHPublicKey: "ssh-rsa AAAA...",
+		SSHPassword: "ssh-rsa AAAA...",
 		Image:        "nvidia/cuda:12.1-runtime-ubuntu22.04",
 		MemoryBytes:  16 * 1024 * 1024 * 1024,
 		CPUCount:     8,
@@ -91,7 +91,7 @@ func TestHandleStartRental_MissingSessionID_Returns400(t *testing.T) {
 
 	reqBody := StartRentalRequest{
 		GPUDeviceID:  "GPU-uuid-456",
-		SSHPublicKey: "ssh-rsa AAAA...",
+		SSHPassword: "ssh-rsa AAAA...",
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -115,7 +115,7 @@ func TestHandleStartRental_MissingGPUDeviceID_Returns400(t *testing.T) {
 
 	reqBody := StartRentalRequest{
 		SessionID:    "session-123",
-		SSHPublicKey: "ssh-rsa AAAA...",
+		SSHPassword: "ssh-rsa AAAA...",
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -169,7 +169,7 @@ func TestHandleStartRental_DuplicateSession_Returns409(t *testing.T) {
 	reqBody := StartRentalRequest{
 		SessionID:    "session-123",
 		GPUDeviceID:  "GPU-uuid-456",
-		SSHPublicKey: "ssh-rsa AAAA...",
+		SSHPassword: "ssh-rsa AAAA...",
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -199,7 +199,7 @@ func TestHandleStartRental_ContainerNotReady_Returns503(t *testing.T) {
 	reqBody := StartRentalRequest{
 		SessionID:    "session-123",
 		GPUDeviceID:  "GPU-uuid-456",
-		SSHPublicKey: "ssh-rsa AAAA...",
+		SSHPassword: "ssh-rsa AAAA...",
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -237,7 +237,7 @@ func TestHandleStartRental_DefaultValues(t *testing.T) {
 	reqBody := StartRentalRequest{
 		SessionID:    "session-123",
 		GPUDeviceID:  "GPU-uuid-456",
-		SSHPublicKey: "ssh-rsa AAAA...",
+		SSHPassword: "ssh-rsa AAAA...",
 		// Omit Image, MemoryBytes, CPUCount to test defaults
 	}
 

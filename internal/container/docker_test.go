@@ -3,11 +3,15 @@ package container
 import (
 	"context"
 	"errors"
+	"io"
+	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
@@ -99,6 +103,15 @@ func (m *MockDockerClient) ContainerWait(ctx context.Context, containerID string
 	return waitCh, errCh
 }
 
+func (m *MockDockerClient) ImagePull(ctx context.Context, refStr string, options image.PullOptions) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("{}")), nil
+}
+
+func (m *MockDockerClient) ImageInspect(ctx context.Context, imageID string, inspectOpts ...client.ImageInspectOption) (image.InspectResponse, error) {
+	// Return success (image found locally) by default
+	return image.InspectResponse{}, nil
+}
+
 func (m *MockDockerClient) Close() error {
 	m.CloseCalled++
 	return nil
@@ -117,7 +130,7 @@ func TestCreateContainer_Success(t *testing.T) {
 		SessionID:    "session-abc",
 		Image:        "nvidia/cuda:12.1-runtime-ubuntu22.04",
 		GPUDeviceID:  "GPU-uuid-123",
-		SSHPublicKey: "ssh-rsa AAAAB3...",
+		SSHPassword: "ssh-rsa AAAAB3...",
 		MemoryBytes:  8 * 1024 * 1024 * 1024, // 8GB
 		CPUCount:     4,
 	}
@@ -129,16 +142,15 @@ func TestCreateContainer_Success(t *testing.T) {
 	assert.Equal(t, 1, mock.CreateCalled)
 	assert.Equal(t, "session-abc", mock.LastContainerName)
 	assert.Equal(t, cfg.Image, mock.LastCreateConfig.Image)
-	assert.Contains(t, mock.LastCreateConfig.Env, "PUBLIC_KEY=ssh-rsa AAAAB3...")
+	assert.Contains(t, mock.LastCreateConfig.Env, "SSH_PASSWORD=ssh-rsa AAAAB3...")
 	assert.Contains(t, mock.LastCreateConfig.Env, "USER_NAME=ubuntu")
-	assert.Contains(t, mock.LastCreateConfig.Env, "SUDO_ACCESS=true")
 	assert.NotNil(t, mock.LastCreateConfig.ExposedPorts["22/tcp"])
-	assert.True(t, mock.LastHostConfig.PublishAllPorts)
+	assert.NotNil(t, mock.LastHostConfig.PortBindings["22/tcp"])
 	assert.Equal(t, cfg.MemoryBytes, mock.LastHostConfig.Resources.Memory)
 	assert.Equal(t, cfg.CPUCount*1e9, mock.LastHostConfig.Resources.NanoCPUs)
 }
 
-func TestCreateContainer_SetsGPUDeviceRequest(t *testing.T) {
+func TestCreateContainer_SetsGPUViaEnvAndRuntime(t *testing.T) {
 	mock := &MockDockerClient{
 		CreateResponse: container.CreateResponse{
 			ID: "container-123",
@@ -148,22 +160,22 @@ func TestCreateContainer_SetsGPUDeviceRequest(t *testing.T) {
 	svc := NewDockerServiceWithClient(mock)
 
 	cfg := ContainerConfig{
-		SessionID:    "session-abc",
-		Image:        "nvidia/cuda:12.1-runtime-ubuntu22.04",
-		GPUDeviceID:  "GPU-uuid-456",
-		SSHPublicKey: "ssh-rsa AAAAB3...",
-		MemoryBytes:  4 * 1024 * 1024 * 1024,
-		CPUCount:     2,
+		SessionID:   "session-abc",
+		Image:       "nvidia/cuda:12.1-runtime-ubuntu22.04",
+		GPUDeviceID: "GPU-uuid-456",
+		SSHPassword: "testpass",
+		SSHPort:     30001,
+		MemoryBytes: 4 * 1024 * 1024 * 1024,
+		CPUCount:    2,
 	}
 
 	_, err := svc.CreateContainer(context.Background(), cfg)
 
 	require.NoError(t, err)
-	assert.Equal(t, 1, len(mock.LastHostConfig.Resources.DeviceRequests))
-	deviceReq := mock.LastHostConfig.Resources.DeviceRequests[0]
-	assert.Equal(t, "nvidia", deviceReq.Driver)
-	assert.Equal(t, []string{"GPU-uuid-456"}, deviceReq.DeviceIDs)
-	assert.Equal(t, [][]string{{"gpu"}}, deviceReq.Capabilities)
+	// GPU via NVIDIA_VISIBLE_DEVICES env var + nvidia runtime
+	assert.Contains(t, mock.LastCreateConfig.Env, "NVIDIA_VISIBLE_DEVICES=GPU-uuid-456")
+	assert.Contains(t, mock.LastCreateConfig.Env, "NVIDIA_DRIVER_CAPABILITIES=all")
+	assert.Equal(t, "nvidia", mock.LastHostConfig.Runtime)
 }
 
 func TestStartContainer_Success(t *testing.T) {

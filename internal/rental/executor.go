@@ -36,13 +36,13 @@ type ConnectionInfo struct {
 
 // StartRentalRequest contains parameters for starting a rental
 type StartRentalRequest struct {
-	SessionID    string
-	Image        string
-	GPUDeviceID  string
-	SSHPublicKey string
-	MemoryBytes  int64
-	CPUCount     int64
-	Host         string // Host address for SSH command (e.g., "provider.example.com")
+	SessionID   string
+	Image       string
+	GPUDeviceID string
+	SSHPassword string
+	MemoryBytes int64
+	CPUCount    int64
+	Host        string // Host address for SSH command (e.g., "provider.example.com")
 }
 
 // DockerServiceInterface defines operations needed from Docker service
@@ -110,14 +110,15 @@ func (re *RentalExecutor) StartRental(ctx context.Context, req StartRentalReques
 		_ = re.portManager.Release(sshPort)
 	}
 
-	// Create container
+	// Create container with SSH on the allocated port
 	containerConfig := container.ContainerConfig{
-		SessionID:    req.SessionID,
-		Image:        req.Image,
-		GPUDeviceID:  req.GPUDeviceID,
-		SSHPublicKey: req.SSHPublicKey,
-		MemoryBytes:  req.MemoryBytes,
-		CPUCount:     req.CPUCount,
+		SessionID:   req.SessionID,
+		Image:       req.Image,
+		GPUDeviceID: req.GPUDeviceID,
+		SSHPassword: req.SSHPassword,
+		SSHPort:     sshPort,
+		MemoryBytes: req.MemoryBytes,
+		CPUCount:    req.CPUCount,
 	}
 
 	containerID, err = re.docker.CreateContainer(ctx, containerConfig)

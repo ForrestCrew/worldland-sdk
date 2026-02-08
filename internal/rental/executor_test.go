@@ -110,7 +110,7 @@ func TestStartRental_AllocatesPortAndCreatesContainer(t *testing.T) {
 		SessionID:    "session-123",
 		Image:        "nvidia/cuda:12.1-runtime-ubuntu22.04",
 		GPUDeviceID:  "GPU-uuid-456",
-		SSHPublicKey: "ssh-rsa AAAA...",
+		SSHPassword: "ssh-rsa AAAA...",
 		MemoryBytes:  8 * 1024 * 1024 * 1024,
 		CPUCount:     4,
 		Host:         "provider.example.com",

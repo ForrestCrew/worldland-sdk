@@ -100,12 +100,13 @@ func (m *MiningDaemon) Start(ctx context.Context) error {
 	gpuDeviceID := availableGPUs[0]
 
 	containerConfig := container.ContainerConfig{
-		SessionID:    "worldland-mining",
-		Image:        m.config.Image,
-		GPUDeviceID:  gpuDeviceID,
-		SSHPublicKey: "", // No SSH needed for mining
-		MemoryBytes:  8 * 1024 * 1024 * 1024, // 8GB
-		CPUCount:     2,
+		SessionID:          "worldland-mining",
+		Image:              m.config.Image,
+		GPUDeviceID:        gpuDeviceID,
+		SSHPassword:        "",
+		MemoryBytes:        8 * 1024 * 1024 * 1024, // 8GB
+		CPUCount:           2,
+		UseImageEntrypoint: true, // Use image's default entrypoint (no SSH)
 	}
 
 	containerID, err := m.docker.CreateContainer(ctx, containerConfig)

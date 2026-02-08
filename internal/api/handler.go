@@ -14,7 +14,7 @@ type StartRentalRequest struct {
 	SessionID    string `json:"sessionId"`
 	GPUDeviceID  string `json:"gpuDeviceId"`  // NVIDIA UUID
 	Image        string `json:"image"`        // Container image
-	SSHPublicKey string `json:"sshPublicKey"`
+	SSHPassword string `json:"sshPassword"`
 	MemoryBytes  int64  `json:"memoryBytes"`
 	CPUCount     int64  `json:"cpuCount"`
 }
@@ -88,8 +88,8 @@ func (h *RentalHandler) HandleStartRental(w http.ResponseWriter, r *http.Request
 		h.writeError(w, http.StatusBadRequest, "gpuDeviceId is required", "MISSING_GPU_DEVICE_ID")
 		return
 	}
-	if req.SSHPublicKey == "" {
-		h.writeError(w, http.StatusBadRequest, "sshPublicKey is required", "MISSING_SSH_KEY")
+	if req.SSHPassword == "" {
+		h.writeError(w, http.StatusBadRequest, "sshPassword is required", "MISSING_SSH_PASSWORD")
 		return
 	}
 
@@ -109,7 +109,7 @@ func (h *RentalHandler) HandleStartRental(w http.ResponseWriter, r *http.Request
 		SessionID:    req.SessionID,
 		GPUDeviceID:  req.GPUDeviceID,
 		Image:        req.Image,
-		SSHPublicKey: req.SSHPublicKey,
+		SSHPassword: req.SSHPassword,
 		MemoryBytes:  req.MemoryBytes,
 		CPUCount:     req.CPUCount,
 		Host:         h.hostAddr,

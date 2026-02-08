@@ -110,6 +110,15 @@ func (c *Client) Listen() {
 	}
 }
 
+// Send sends a raw message to Hub via mTLS connection
+func (c *Client) Send(data []byte) error {
+	if c.conn == nil {
+		return fmt.Errorf("not connected")
+	}
+	_, err := c.conn.Write(data)
+	return err
+}
+
 // Close closes the connection
 func (c *Client) Close() {
 	close(c.stopCh)
