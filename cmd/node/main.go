@@ -135,19 +135,19 @@ func main() {
 	siweDomain := flag.String("siwe-domain", "", "SIWE domain for authentication (defaults to hub-http host)")
 	gpuType := flag.String("gpu-type", "NVIDIA RTX 4090", "GPU type for registration")
 	memoryGB := flag.Int("memory-gb", 24, "GPU memory in GB for registration")
-	pricePerSec := flag.String("price-per-sec", "2777777777777778", "Price per second in wei (default: 0.01 WLC/hr)")
+	pricePerSec := flag.String("price-per-sec", "2777777777778", "Price per second in wei (default: 0.01 WLC/hr)")
 
 	flag.Parse()
 
-	// Validate minimum price: 0.01 WLC/hr = 2777777777777778 wei/sec
+	// Validate minimum price: 0.01 WLC/hr = 2777777777778 wei/sec
 	minPricePerSec := new(big.Int)
-	minPricePerSec.SetString("2777777777777778", 10)
+	minPricePerSec.SetString("2777777777778", 10)
 	userPrice := new(big.Int)
 	if _, ok := userPrice.SetString(*pricePerSec, 10); !ok {
 		log.Fatalf("Invalid price-per-sec value: %s", *pricePerSec)
 	}
 	if userPrice.Cmp(minPricePerSec) < 0 {
-		log.Fatalf("price-per-sec must be at least 2777777777777778 (0.01 WLC/hr), got: %s", *pricePerSec)
+		log.Fatalf("price-per-sec must be at least 2777777777778 (0.01 WLC/hr), got: %s", *pricePerSec)
 	}
 
 	if *hostAddr == "" {

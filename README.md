@@ -224,7 +224,7 @@ sudo systemctl enable --now worldland-node
 | `-cert-dir` | `~/.worldland/certs` | 인증서 저장 경로 |
 | `-gpu-type` | (auto-detect) | GPU 타입 (NVML 자동감지) |
 | `-memory-gb` | (auto-detect) | GPU 메모리 GB (NVML 자동감지) |
-| `-price-per-sec` | `2777777777777778` | 초당 임대 가격 (wei, 최소 0.01 WLC/hr) |
+| `-price-per-sec` | `2777777777778` | 초당 임대 가격 (wei, 최소 0.01 WLC/hr) |
 
 ## Supported GPU Images
 
