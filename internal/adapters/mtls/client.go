@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
+	"time"
 )
 
 // Command represents a command received from Hub
@@ -30,10 +32,14 @@ type Client struct {
 	cert     tls.Certificate
 	rootCAs  *x509.CertPool
 	conn     net.Conn
+	connMu   sync.Mutex
 	stopCh   chan struct{}
 
 	// OnCommand is called when a command is received from Hub
 	OnCommand func(cmd Command) CommandAck
+
+	// OnReconnected is called after a successful reconnection
+	OnReconnected func()
 }
 
 // NewClient creates a new mTLS client
@@ -66,14 +72,65 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("TLS handshake failed: %w", err)
 	}
 
+	c.connMu.Lock()
 	c.conn = conn
+	c.connMu.Unlock()
 	log.Printf("Connected to Hub via mTLS")
 	return nil
 }
 
-// Listen starts listening for commands from Hub
+// Listen starts listening for commands from Hub with automatic reconnection
 func (c *Client) Listen() {
-	defer c.conn.Close()
+	for {
+		c.listenOnce()
+
+		// Check if we should stop
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
+
+		// Reconnect with backoff
+		log.Printf("Connection to Hub lost, reconnecting...")
+		backoff := 5 * time.Second
+		maxBackoff := 60 * time.Second
+		for {
+			select {
+			case <-c.stopCh:
+				return
+			case <-time.After(backoff):
+			}
+
+			if err := c.Connect(); err != nil {
+				log.Printf("Reconnect failed: %v (retry in %v)", err, backoff)
+				backoff = backoff * 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			}
+
+			log.Printf("Reconnected to Hub")
+			if c.OnReconnected != nil {
+				c.OnReconnected()
+			}
+			break
+		}
+	}
+}
+
+// listenOnce reads from current connection until error
+func (c *Client) listenOnce() {
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+
+	if conn == nil {
+		return
+	}
+
+	defer conn.Close()
 
 	buf := make([]byte, 4096)
 	for {
@@ -81,7 +138,7 @@ func (c *Client) Listen() {
 		case <-c.stopCh:
 			return
 		default:
-			n, err := c.conn.Read(buf)
+			n, err := conn.Read(buf)
 			if err != nil {
 				log.Printf("Read error: %v", err)
 				return
@@ -103,7 +160,7 @@ func (c *Client) Listen() {
 
 			// Send acknowledgment
 			ackData, _ := json.Marshal(ack)
-			if _, err := c.conn.Write(ackData); err != nil {
+			if _, err := conn.Write(ackData); err != nil {
 				log.Printf("Failed to send ack: %v", err)
 			}
 		}
@@ -112,17 +169,23 @@ func (c *Client) Listen() {
 
 // Send sends a raw message to Hub via mTLS connection
 func (c *Client) Send(data []byte) error {
-	if c.conn == nil {
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+
+	if conn == nil {
 		return fmt.Errorf("not connected")
 	}
-	_, err := c.conn.Write(data)
+	_, err := conn.Write(data)
 	return err
 }
 
 // Close closes the connection
 func (c *Client) Close() {
 	close(c.stopCh)
+	c.connMu.Lock()
 	if c.conn != nil {
 		c.conn.Close()
 	}
+	c.connMu.Unlock()
 }
