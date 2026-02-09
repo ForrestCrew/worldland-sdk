@@ -111,6 +111,18 @@ sudo apt-get install -y nvidia-container-toolkit
 
 # Docker에 NVIDIA 런타임 등록
 sudo nvidia-ctk runtime configure --runtime=docker
+
+# Docker DNS 설정 (필수!)
+# Ubuntu 18.04+는 systemd-resolved(127.0.0.53)를 사용하여
+# Docker 컨테이너 내부에서 DNS가 작동하지 않습니다.
+# Google Public DNS를 명시적으로 설정해야 합니다.
+sudo bash -c 'cat /etc/docker/daemon.json | python3 -c "
+import sys, json
+cfg = json.load(sys.stdin)
+cfg[\"dns\"] = [\"8.8.8.8\", \"8.8.4.4\"]
+json.dump(cfg, sys.stdout, indent=4)
+" > /tmp/daemon.json && mv /tmp/daemon.json /etc/docker/daemon.json'
+
 sudo systemctl restart docker
 ```
 
@@ -263,6 +275,31 @@ sudo systemctl restart docker
 
 # 확인
 docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi
+```
+
+### 컨테이너 내부 DNS 실패 (SSH 접속 불가)
+
+**증상:** 임대 컨테이너가 즉시 종료됨 (Exited code 100). 컨테이너 로그에 `Temporary failure resolving 'archive.ubuntu.com'` 표시
+
+**원인:** Ubuntu 18.04+ 기본 DNS가 `systemd-resolved` (`127.0.0.53`). Docker 컨테이너 내부에서는 이 주소에 DNS 서비스가 없어서 패키지 설치(`openssh-server`) 실패 → 컨테이너 크래시
+
+**영향:** GCP, AWS, Azure 등 모든 클라우드 Ubuntu VM에서 발생 가능 (Docker 직접 사용 시에만 해당. K8s 클러스터는 CoreDNS가 별도로 동작하여 이 문제 없음)
+
+**해결:**
+```bash
+# /etc/docker/daemon.json에 dns 추가
+sudo python3 -c "
+import json
+with open('/etc/docker/daemon.json') as f:
+    cfg = json.load(f)
+cfg['dns'] = ['8.8.8.8', '8.8.4.4']
+with open('/etc/docker/daemon.json', 'w') as f:
+    json.dump(cfg, f, indent=4)
+"
+sudo systemctl restart docker
+
+# 검증
+docker run --rm ubuntu:22.04 bash -c 'apt-get update -qq && echo DNS_OK'
 ```
 
 ### 이미지 Pull 타임아웃
