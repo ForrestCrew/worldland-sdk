@@ -158,7 +158,8 @@ func (d *NodeDaemon) handleStartRental(cmd mtls.Command) mtls.CommandAck {
 	}
 
 	// Use rental executor to create and start Docker container
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// 10 minutes to allow large image pulls (e.g., pytorch CUDA ~10GB)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	connInfo, err := d.rentalExecutor.StartRental(ctx, rental.StartRentalRequest{
