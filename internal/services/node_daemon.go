@@ -1,36 +1,44 @@
 package services
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"fmt"
 	"log"
-	"net"
 	"time"
 
 	"github.com/worldland/worldland-node/internal/adapters/mtls"
 	"github.com/worldland/worldland-node/internal/domain"
-	"github.com/worldland/worldland-node/internal/mining"
-	"github.com/worldland/worldland-node/internal/rental"
 )
 
-// NodeDaemon manages the node lifecycle, handles Hub commands via mTLS,
-// and executes Docker-based GPU rentals.
+// ClusterCapacity mirrors proxy's ProviderCapacity for heartbeat reporting.
+// Hub uses this to track provider resources.
+type ClusterCapacity struct {
+	// GPU tracking by type (proxy pattern: map[string]int)
+	TotalGPUs     map[string]int `json:"total_gpus,omitempty"`     // {"RTX 4090": 4}
+	AvailableGPUs map[string]int `json:"available_gpus,omitempty"` // {"RTX 4090": 2}
+	InUseGPUs     map[string]int `json:"in_use_gpus,omitempty"`    // {"RTX 4090": 2}
+
+	// CPU/Memory tracking
+	TotalCPUCores     int `json:"total_cpu_cores"`
+	AvailableCPUCores int `json:"available_cpu_cores"`
+	TotalMemoryMB     int `json:"total_memory_mb"`
+	AvailableMemoryMB int `json:"available_memory_mb"`
+
+	// Node info
+	NodeCount int `json:"node_count"`
+}
+
+// NodeDaemon manages the node lifecycle and Hub mTLS connection.
+// V4: Master mode only — no Docker execution, just heartbeat + capacity reporting.
+// Mirrors proxy's provider-agent heartbeat pattern.
 type NodeDaemon struct {
 	gpuProvider     domain.GPUProvider
 	mtlsClient      *mtls.Client
-	nodeID          string
-	hostAddr        string // Public host address for SSH connections
-	metricsInterval time.Duration
-	stopCh          chan struct{}
-
-	// Docker rental executor (set via WithRentalExecutor)
-	rentalExecutor *rental.RentalExecutor
-
-	// Mining daemon (set via WithMiningDaemon)
-	miningDaemon *mining.MiningDaemon
+	nodeID           string
+	clusterCapacity  *ClusterCapacity // Set by master mode after cluster discovery
+	metricsInterval  time.Duration
+	stopCh           chan struct{}
 }
 
 // NewNodeDaemon creates a new node daemon
@@ -43,25 +51,20 @@ func NewNodeDaemon(gpuProvider domain.GPUProvider, nodeID string) *NodeDaemon {
 	}
 }
 
-// WithRentalExecutor sets the rental executor for Docker-based rentals
-func (d *NodeDaemon) WithRentalExecutor(executor *rental.RentalExecutor, hostAddr string) *NodeDaemon {
-	d.rentalExecutor = executor
-	d.hostAddr = hostAddr
-	return d
-}
-
-// WithMiningDaemon sets the mining daemon for auto-mining when GPU is idle
-func (d *NodeDaemon) WithMiningDaemon(md *mining.MiningDaemon) *NodeDaemon {
-	d.miningDaemon = md
-	return d
+// SetClusterCapacity sets the cluster capacity for heartbeat reporting
+func (d *NodeDaemon) SetClusterCapacity(cap *ClusterCapacity) {
+	d.clusterCapacity = cap
 }
 
 // ConnectToHub establishes mTLS connection to Hub
 func (d *NodeDaemon) ConnectToHub(hubAddr string, cert tls.Certificate, rootCAs *x509.CertPool) error {
 	d.mtlsClient = mtls.NewClient(hubAddr, cert, rootCAs)
 
-	// Set up command handler
-	d.mtlsClient.OnCommand = d.handleCommand
+	// V4: No command handling — Hub manages K8s pods directly via kubeconfig
+	d.mtlsClient.OnCommand = func(cmd mtls.Command) mtls.CommandAck {
+		log.Printf("Received command from Hub: %s (type: %s) — ignoring in master mode", cmd.ID, cmd.Type)
+		return mtls.CommandAck{CommandID: cmd.ID, Status: "ok"}
+	}
 
 	if err := d.mtlsClient.Connect(); err != nil {
 		return err
@@ -73,17 +76,17 @@ func (d *NodeDaemon) ConnectToHub(hubAddr string, cert tls.Certificate, rootCAs 
 
 // Start begins the daemon's main loops
 func (d *NodeDaemon) Start() error {
-	// Initialize GPU provider
+	// Initialize GPU provider for local hardware info
 	if err := d.gpuProvider.Init(); err != nil {
 		log.Printf("Warning: GPU provider init failed: %v (continuing without GPU metrics)", err)
 	} else {
 		defer d.gpuProvider.Shutdown()
 	}
 
-	// Start listening for commands
+	// Start listening for commands (even if ignored, keeps connection alive)
 	go d.mtlsClient.Listen()
 
-	// Start metrics reporting
+	// Start heartbeat loop
 	go d.reportMetrics()
 
 	// Wait for stop signal
@@ -91,168 +94,8 @@ func (d *NodeDaemon) Start() error {
 	return nil
 }
 
-// handleCommand processes commands received from Hub
-func (d *NodeDaemon) handleCommand(cmd mtls.Command) mtls.CommandAck {
-	log.Printf("Received command: %s (type: %s)", cmd.ID, cmd.Type)
-
-	switch cmd.Type {
-	case "start_rental":
-		return d.handleStartRental(cmd)
-	case "stop_rental":
-		return d.handleStopRental(cmd)
-	case "start_job":
-		// Legacy alias for start_rental
-		return d.handleStartRental(cmd)
-	case "stop_job":
-		// Legacy alias for stop_rental
-		return d.handleStopRental(cmd)
-	default:
-		log.Printf("Unknown command type: %s", cmd.Type)
-		return mtls.CommandAck{CommandID: cmd.ID, Status: "error", Error: "unknown command"}
-	}
-}
-
-// handleStartRental creates and starts a Docker container for a GPU rental
-func (d *NodeDaemon) handleStartRental(cmd mtls.Command) mtls.CommandAck {
-	if d.rentalExecutor == nil {
-		return mtls.CommandAck{
-			CommandID: cmd.ID,
-			Status:    "error",
-			Error:     "rental executor not configured",
-		}
-	}
-
-	// Extract payload fields
-	sessionID, _ := cmd.Payload["session_id"].(string)
-	if sessionID == "" {
-		return mtls.CommandAck{CommandID: cmd.ID, Status: "error", Error: "missing session_id"}
-	}
-
-	image, _ := cmd.Payload["image"].(string)
-	if image == "" {
-		image = "nvidia/cuda:12.1.1-runtime-ubuntu22.04"
-	}
-
-	gpuDeviceID, _ := cmd.Payload["gpu_device_id"].(string)
-	sshPassword, _ := cmd.Payload["ssh_password"].(string)
-
-	cpuCount := int64(4)
-	if v, ok := cmd.Payload["cpu_count"].(float64); ok {
-		cpuCount = int64(v)
-	}
-
-	memoryMB := int64(16384)
-	if v, ok := cmd.Payload["memory_mb"].(float64); ok {
-		memoryMB = int64(v)
-	}
-
-	log.Printf("Starting rental: session=%s image=%s gpu=%s", sessionID, image, gpuDeviceID)
-
-	// Pause mining to release GPU for rental
-	if d.miningDaemon != nil && gpuDeviceID != "" {
-		pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := d.miningDaemon.PauseForRental(pauseCtx, []string{gpuDeviceID}); err != nil {
-			log.Printf("Warning: failed to pause mining for rental: %v", err)
-		}
-		pauseCancel()
-	}
-
-	// Use rental executor to create and start Docker container
-	// 10 minutes to allow large image pulls (e.g., pytorch CUDA ~10GB)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	connInfo, err := d.rentalExecutor.StartRental(ctx, rental.StartRentalRequest{
-		SessionID:    sessionID,
-		Image:        image,
-		GPUDeviceID:  gpuDeviceID,
-		SSHPassword: sshPassword,
-		MemoryBytes:  memoryMB * 1024 * 1024,
-		CPUCount:     cpuCount,
-		Host:         d.hostAddr,
-	})
-	if err != nil {
-		log.Printf("Failed to start rental %s: %v", sessionID, err)
-		return mtls.CommandAck{
-			CommandID: cmd.ID,
-			Status:    "error",
-			Error:     fmt.Sprintf("failed to start rental: %v", err),
-		}
-	}
-
-	log.Printf("Rental started: session=%s ssh=%s:%d", sessionID, connInfo.Host, connInfo.Port)
-
-	// Resolve public IP if host is hostname
-	sshHost := d.hostAddr
-	if sshHost == "" || sshHost == "localhost" {
-		// Try to get the machine's public IP
-		sshHost = getOutboundIP()
-	}
-
-	return mtls.CommandAck{
-		CommandID: cmd.ID,
-		Status:    "ok",
-		Payload: map[string]interface{}{
-			"session_id":   sessionID,
-			"ssh_host":     sshHost,
-			"ssh_port":     float64(connInfo.Port),
-			"ssh_user":     connInfo.User,
-			"container_id": connInfo.ContainerID,
-		},
-	}
-}
-
-// handleStopRental stops and cleans up a Docker container for a GPU rental
-func (d *NodeDaemon) handleStopRental(cmd mtls.Command) mtls.CommandAck {
-	if d.rentalExecutor == nil {
-		return mtls.CommandAck{
-			CommandID: cmd.ID,
-			Status:    "error",
-			Error:     "rental executor not configured",
-		}
-	}
-
-	sessionID, _ := cmd.Payload["session_id"].(string)
-	if sessionID == "" {
-		return mtls.CommandAck{CommandID: cmd.ID, Status: "error", Error: "missing session_id"}
-	}
-
-	log.Printf("Stopping rental: session=%s", sessionID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := d.rentalExecutor.StopRental(ctx, sessionID); err != nil {
-		log.Printf("Failed to stop rental %s: %v", sessionID, err)
-		// Return ok even on error - Hub should mark session as stopped regardless
-		return mtls.CommandAck{
-			CommandID: cmd.ID,
-			Status:    "ok",
-			Error:     fmt.Sprintf("stop warning: %v", err),
-		}
-	}
-
-	log.Printf("Rental stopped: session=%s", sessionID)
-
-	// Resume mining after rental ends - GPU is now available
-	if d.miningDaemon != nil {
-		resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := d.miningDaemon.ResumeAfterRental(resumeCtx, []string{}); err != nil {
-			log.Printf("Warning: failed to resume mining after rental: %v", err)
-		}
-		resumeCancel()
-	}
-
-	return mtls.CommandAck{
-		CommandID: cmd.ID,
-		Status:    "ok",
-		Payload: map[string]interface{}{
-			"session_id": sessionID,
-		},
-	}
-}
-
-// reportMetrics periodically collects and reports GPU metrics + mining status
+// reportMetrics periodically sends heartbeats with GPU metrics + cluster capacity to Hub.
+// Mirrors proxy's heartbeatLoop pattern.
 func (d *NodeDaemon) reportMetrics() {
 	ticker := time.NewTicker(d.metricsInterval)
 	defer ticker.Stop()
@@ -267,9 +110,7 @@ func (d *NodeDaemon) reportMetrics() {
 				log.Printf("Failed to collect GPU metrics: %v", err)
 				continue
 			}
-			log.Printf("Collected metrics for %d GPU(s)", len(metrics))
 
-			// Build heartbeat message with GPU metrics + mining status
 			heartbeat := d.buildHeartbeat(metrics)
 			if d.mtlsClient != nil {
 				if err := d.mtlsClient.Send(heartbeat); err != nil {
@@ -280,26 +121,21 @@ func (d *NodeDaemon) reportMetrics() {
 	}
 }
 
-// buildHeartbeat creates a JSON heartbeat message with metrics and mining status
+// buildHeartbeat creates a JSON heartbeat message with metrics + cluster capacity.
+// Hub parses this to update provider node capacity in DB.
+// Mirrors proxy's HeartbeatMessage structure.
 func (d *NodeDaemon) buildHeartbeat(gpuMetrics []domain.GPUMetrics) []byte {
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"gpu_metrics": gpuMetrics,
+		"mode":        "master",
 	}
 
-	// Include mining status if mining daemon is configured
-	if d.miningDaemon != nil {
-		status := d.miningDaemon.Status()
-		payload["mining"] = map[string]interface{}{
-			"state":        string(status.State),
-			"container_id": status.ContainerID,
-			"gpu_count":    status.GPUCount,
-		}
-		if status.StartedAt != nil {
-			payload["mining"].(map[string]interface{})["started_at"] = status.StartedAt.Format(time.RFC3339)
-		}
+	// Include cluster capacity if available (proxy's CapacityUpdate pattern)
+	if d.clusterCapacity != nil {
+		payload["cluster_capacity"] = d.clusterCapacity
 	}
 
-	msg := map[string]interface{}{
+	msg := map[string]any{
 		"type":    "heartbeat",
 		"payload": payload,
 	}
@@ -314,15 +150,4 @@ func (d *NodeDaemon) Stop() {
 	if d.mtlsClient != nil {
 		d.mtlsClient.Close()
 	}
-}
-
-// getOutboundIP gets the preferred outbound IP of this machine
-func getOutboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "localhost"
-	}
-	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
 }

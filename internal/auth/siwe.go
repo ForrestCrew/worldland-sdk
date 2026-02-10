@@ -252,6 +252,46 @@ func (c *SIWEClient) RegisterNode(gpuUUID, gpuType string, memoryGB int, pricePe
 	return result.NodeID, nil
 }
 
+// RegisterK8sProvider registers a K8s cluster provider with Hub using kubeconfig
+func (c *SIWEClient) RegisterK8sProvider(kubeconfig string) (providerID string, err error) {
+	if c.token == "" {
+		return "", fmt.Errorf("not authenticated - call Login() first")
+	}
+
+	payload := map[string]string{
+		"walletAddress": c.address,
+		"kubeconfig":    kubeconfig,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", c.hubURL+"/api/v1/providers/k8s", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("K8s provider registration failed: %d - %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		ProviderID string `json:"providerId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	return result.ProviderID, nil
+}
+
 // CertificateBundle contains the certificate bundle from Hub
 type CertificateBundle struct {
 	Certificate   string `json:"certificate"`
